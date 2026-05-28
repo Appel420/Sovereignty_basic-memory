@@ -8,9 +8,11 @@ from typing import Optional  # noqa: E402
 
 import typer  # noqa: E402
 
+from basic_memory.cli.auto_update import maybe_run_periodic_auto_update  # noqa: E402
 from basic_memory.cli.container import CliContainer, set_container  # noqa: E402
-from basic_memory.cli.promo import maybe_show_cloud_promo  # noqa: E402
+from basic_memory.cli.promo import maybe_show_cloud_promo, maybe_show_init_line  # noqa: E402
 from basic_memory.config import init_cli_logging  # noqa: E402
+import logfire  # noqa: E402
 
 
 def version_callback(value: bool) -> None:
@@ -41,13 +43,33 @@ def app_callback(
 
     # Initialize logging for CLI (file only, no stdout)
     init_cli_logging()
+    command_name = ctx.invoked_subcommand or "root"
+    ctx.with_resource(
+        logfire.span(
+            f"cli.command.{command_name}",
+            entrypoint="cli",
+            command_name=command_name,
+        )
+    )
 
     # --- Composition Root ---
     # Create container and read config (single point of config access)
     container = CliContainer.create()
     set_container(container)
 
-    maybe_show_cloud_promo(ctx.invoked_subcommand)
+    # Trigger: first-run init confirmation before command output.
+    # Why: informational "initialized" message belongs above command results, not in the upsell panel.
+    # Outcome: one-time plain line printed before the subcommand runs.
+    maybe_show_init_line(ctx.invoked_subcommand)
+
+    # Trigger: register post-command messaging callbacks.
+    # Why: informational/promo/update output belongs below command results.
+    # Outcome: command output remains primary, with optional follow-up notices afterwards.
+    def _post_command_messages() -> None:
+        maybe_show_cloud_promo(ctx.invoked_subcommand)
+        maybe_run_periodic_auto_update(ctx.invoked_subcommand)
+
+    ctx.call_on_close(_post_command_messages)
 
     # Run initialization for commands that don't use the API
     # Skip for 'mcp' command - it has its own lifespan that handles initialization
@@ -62,6 +84,7 @@ def app_callback(
         "tool",
         "reset",
         "reindex",
+        "update",
         "watch",
     }
     if (

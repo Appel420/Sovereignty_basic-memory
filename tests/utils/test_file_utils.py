@@ -4,6 +4,7 @@ import random
 import string
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -55,7 +56,7 @@ async def test_compute_checksum_error():
     """Test checksum error handling."""
     with pytest.raises(FileError):
         # Try to hash an object that can't be encoded
-        await compute_checksum(object())  # pyright: ignore [reportArgumentType]
+        await compute_checksum(cast(Any, object()))
 
 
 @pytest.mark.asyncio
@@ -196,6 +197,19 @@ def test_sanitize_for_filename_removes_invalid_characters():
         sanitized_text = sanitize_for_filename(text)
 
         assert char not in sanitized_text
+
+
+def test_sanitize_for_filename_strips_trailing_periods():
+    """Trailing periods cause double-dot filenames like 'hi-everyone..md'.
+
+    This was a production bug where title "Hi everyone." produced file path
+    "hi-everyone..md" which failed path traversal validation.
+    """
+    assert sanitize_for_filename("Hi everyone.") == "Hi everyone"
+    assert sanitize_for_filename("test...") == "test"
+    assert sanitize_for_filename(".hidden") == "hidden"
+    assert sanitize_for_filename("...dots...") == "dots"
+    assert sanitize_for_filename("normal title") == "normal title"
 
 
 @pytest.mark.parametrize(

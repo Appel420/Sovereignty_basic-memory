@@ -138,6 +138,58 @@ async def test_get_entity_by_id(client: AsyncClient, test_graph, v2_project_url,
 
 
 @pytest.mark.asyncio
+async def test_get_entity_by_id_allows_long_relation_type(
+    client: AsyncClient,
+    v2_project_url,
+    relation_repository,
+):
+    """GET entity should not fail when stored relation_type exceeds 200 characters."""
+    source_response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "Long Relation Source",
+            "directory": "test",
+            "content": "Source entity content",
+        },
+    )
+    assert source_response.status_code == 200
+    source_entity = EntityResponseV2.model_validate(source_response.json())
+
+    target_response = await client.post(
+        f"{v2_project_url}/knowledge/entities",
+        json={
+            "title": "Long Relation Target",
+            "directory": "test",
+            "content": "Target entity content",
+        },
+    )
+    assert target_response.status_code == 200
+    target_entity = EntityResponseV2.model_validate(target_response.json())
+
+    long_relation_type = (
+        "**Architecture/efficiency concern:** "
+        "the orchestration prompt expanded a short edge label into a full descriptive note "
+        "that is much longer than 200 characters but should still serialize cleanly."
+    )
+
+    await relation_repository.create(
+        {
+            "from_id": source_entity.id,
+            "to_id": target_entity.id,
+            "to_name": target_entity.title,
+            "relation_type": long_relation_type,
+        }
+    )
+
+    response = await client.get(f"{v2_project_url}/knowledge/entities/{source_entity.external_id}")
+
+    assert response.status_code == 200
+    entity = EntityResponseV2.model_validate(response.json())
+    assert len(entity.relations) == 1
+    assert entity.relations[0].relation_type == long_relation_type
+
+
+@pytest.mark.asyncio
 async def test_get_entity_by_id_not_found(client: AsyncClient, v2_project_url):
     """Test getting a non-existent entity by external_id returns 404."""
     # Use a UUID format that doesn't exist
@@ -154,7 +206,7 @@ async def test_create_entity(client: AsyncClient, file_service, v2_project_url):
     data = {
         "title": "TestV2Entity",
         "directory": "test",
-        "entity_type": "test",
+        "note_type": "test",
         "content_type": "text/markdown",
         "content": "TestContent for V2",
     }
@@ -173,7 +225,7 @@ async def test_create_entity(client: AsyncClient, file_service, v2_project_url):
 
     assert entity.permalink == "test-project/test/test-v2-entity"
     assert entity.file_path == "test/TestV2Entity.md"
-    assert entity.entity_type == data["entity_type"]
+    assert entity.note_type == data["note_type"]
 
     # Verify file was created
     file_path = file_service.get_entity_path(entity)
@@ -187,7 +239,7 @@ async def test_create_entity_conflict_returns_409(client: AsyncClient, v2_projec
     data = {
         "title": "TestV2EntityConflict",
         "directory": "conflict",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "content": "Original content for conflict",
     }
@@ -215,7 +267,7 @@ async def test_create_entity_returns_content(client: AsyncClient, file_service, 
     data = {
         "title": "TestContentReturn",
         "directory": "test",
-        "entity_type": "note",
+        "note_type": "note",
         "content_type": "text/markdown",
         "content": "Body content for return test",
     }
@@ -250,7 +302,7 @@ async def test_create_entity_with_observations_and_relations(
 
 ## Observations
 - [note] This is a test observation #tag1 (context)
-- related to [[OtherEntity]]
+- "related to" [[OtherEntity]]
 """,
     }
 
@@ -303,6 +355,7 @@ async def test_update_entity_by_id(
     response = await client.put(
         f"{v2_project_url}/knowledge/entities/{original_external_id}",
         json=update_data,
+        params={"fast": False},
     )
 
     assert response.status_code == 200
@@ -311,6 +364,8 @@ async def test_update_entity_by_id(
     # V2 update must return external_id field
     assert updated_entity.external_id is not None
     assert updated_entity.api_version == "v2"
+    assert updated_entity.content is not None
+    assert "Updated content via V2" in updated_entity.content
 
     # Verify file was updated
     file_path = file_service.get_entity_path(updated_entity)
@@ -320,10 +375,10 @@ async def test_update_entity_by_id(
 
 
 @pytest.mark.asyncio
-async def test_update_entity_by_id_fast_does_not_duplicate(
+async def test_update_entity_by_id_does_not_duplicate(
     client: AsyncClient, v2_project_url, entity_repository
 ):
-    """Fast PUT updates the existing external_id without creating duplicates."""
+    """PUT updates the existing external_id without creating duplicates."""
     create_data = {
         "title": "07 - Get Started",
         "directory": "docs",
@@ -350,10 +405,10 @@ async def test_update_entity_by_id_fast_does_not_duplicate(
 
 
 @pytest.mark.asyncio
-async def test_put_entity_fast_returns_minimal_row(
+async def test_put_entity_with_fast_param_returns_fully_indexed_row(
     client: AsyncClient, v2_project_url, entity_repository
 ):
-    """Fast PUT returns a minimal row and persists the external_id immediately."""
+    """PUT ignores the legacy fast param and still returns a fully indexed row."""
     external_id = str(uuid.uuid4())
     update_data = {
         "title": "FastPutEntity",
@@ -376,18 +431,19 @@ async def test_put_entity_fast_returns_minimal_row(
     assert response.status_code == 201
     created_entity = EntityResponseV2.model_validate(response.json())
     assert created_entity.external_id == external_id
-    assert created_entity.observations == []
-    assert created_entity.relations == []
+    assert len(created_entity.observations) == 1
+    assert len(created_entity.relations) == 1
 
     db_entity = await entity_repository.get_by_external_id(external_id)
     assert db_entity is not None
 
 
 @pytest.mark.asyncio
-async def test_fast_create_schedules_reindex_task(
-    client: AsyncClient, v2_project_url, task_scheduler_spy
+async def test_create_with_fast_param_does_not_schedule_reindex_task(
+    client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
 ):
-    """Fast create should enqueue a background reindex task."""
+    """Legacy fast=true should not resurrect the removed reindex note-write path."""
+    app_config.semantic_search_enabled = False
     start_count = len(task_scheduler_spy)
     response = await client.post(
         f"{v2_project_url}/knowledge/entities",
@@ -399,18 +455,14 @@ async def test_fast_create_schedules_reindex_task(
         params={"fast": True},
     )
     assert response.status_code == 200
-    assert len(task_scheduler_spy) == start_count + 1
-    created_entity = EntityResponseV2.model_validate(response.json())
-    scheduled = task_scheduler_spy[-1]
-    assert scheduled["task_name"] == "reindex_entity"
-    assert scheduled["payload"]["entity_id"] == created_entity.id
+    assert len(task_scheduler_spy) == start_count
 
 
 @pytest.mark.asyncio
-async def test_non_fast_create_schedules_vector_sync_when_semantic_enabled(
+async def test_create_schedules_vector_sync_when_semantic_enabled(
     client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
 ):
-    """Non-fast create should schedule vector sync when semantic mode is enabled."""
+    """Create should schedule vector sync when semantic mode is enabled."""
     app_config.semantic_search_enabled = True
     start_count = len(task_scheduler_spy)
 
@@ -433,10 +485,10 @@ async def test_non_fast_create_schedules_vector_sync_when_semantic_enabled(
 
 
 @pytest.mark.asyncio
-async def test_non_fast_create_skips_vector_sync_when_semantic_disabled(
+async def test_create_skips_vector_sync_when_semantic_disabled(
     client: AsyncClient, v2_project_url, task_scheduler_spy, app_config
 ):
-    """Non-fast create should not schedule vector sync when semantic mode is disabled."""
+    """Create should not schedule vector sync when semantic mode is disabled."""
     app_config.semantic_search_enabled = False
     start_count = len(task_scheduler_spy)
 
@@ -480,6 +532,7 @@ async def test_edit_entity_by_id_append(
     response = await client.patch(
         f"{v2_project_url}/knowledge/entities/{original_external_id}",
         json=edit_data,
+        params={"fast": False},
     )
 
     assert response.status_code == 200
@@ -488,6 +541,8 @@ async def test_edit_entity_by_id_append(
     # V2 patch must return external_id field
     assert edited_entity.external_id is not None
     assert edited_entity.api_version == "v2"
+    assert edited_entity.content is not None
+    assert "Appended content" in edited_entity.content
 
     # Verify file has both original and appended content
     file_path = file_service.get_entity_path(edited_entity)
@@ -833,3 +888,22 @@ async def test_delete_directory_v2_nested_structure(client: AsyncClient, v2_proj
     assert result.total_files == 2
     assert result.successful_deletes == 2
     assert result.failed_deletes == 0
+
+
+@pytest.mark.asyncio
+async def test_entity_response_includes_user_tracking_fields(client: AsyncClient, v2_project_url):
+    """EntityResponseV2 includes created_by and last_updated_by fields (null for local)."""
+    entity_data = {
+        "title": "UserTrackingTest",
+        "directory": "test",
+        "content": "Test content",
+    }
+    response = await client.post(f"{v2_project_url}/knowledge/entities", json=entity_data)
+    assert response.status_code == 200
+
+    body = response.json()
+    # Fields should be present in the response (null for local/CLI usage)
+    assert "created_by" in body
+    assert "last_updated_by" in body
+    assert body["created_by"] is None
+    assert body["last_updated_by"] is None

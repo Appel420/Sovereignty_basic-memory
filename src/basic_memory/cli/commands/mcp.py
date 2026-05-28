@@ -1,12 +1,14 @@
 """MCP server command with streamable HTTP transport."""
 
 import os
+import threading
 from typing import Any, Optional
 
 import typer
 from loguru import logger
 
 from basic_memory.cli.app import app
+from basic_memory.cli.auto_update import AutoUpdateStatus, run_auto_update
 from basic_memory.config import ConfigManager, init_mcp_logging
 
 
@@ -36,7 +38,7 @@ def mcp(
     This command starts an MCP server using one of three transport options:
 
     - stdio: Standard I/O (good for local usage)
-    - streamable-http: Recommended for web deployments (default)
+    - streamable-http: Recommended for web deployments
     - sse: Server-Sent Events (for compatibility with existing clients)
 
     Initialization, file sync, and cleanup are handled by the MCP server's lifespan.
@@ -45,10 +47,20 @@ def mcp(
     Users who have cloud mode enabled can still use local MCP for Claude Code
     and Claude Desktop while using cloud MCP for web and mobile access.
     """
-    # Force local routing for local MCP server
-    # Why: The local MCP server should always talk to the local API, not the cloud proxy.
-    # Even when cloud_mode_enabled is True, stdio MCP runs locally and needs local API access.
-    os.environ["BASIC_MEMORY_FORCE_LOCAL"] = "true"
+    # --- Routing setup ---
+    # Trigger: MCP server command invocation.
+    # Why: HTTP/SSE transports serve as local API endpoints and must never
+    #      route through cloud. Stdio is a client-facing protocol that
+    #      should honor per-project routing (local or cloud).
+    # Outcome: HTTP/SSE get explicit local override; stdio passes through
+    #          whatever env vars are already set (honoring external overrides)
+    #          and defaults to per-project routing resolution.
+    if transport in ("streamable-http", "sse"):
+        os.environ["BASIC_MEMORY_FORCE_LOCAL"] = "true"
+        os.environ.pop("BASIC_MEMORY_FORCE_CLOUD", None)
+        os.environ["BASIC_MEMORY_EXPLICIT_ROUTING"] = "true"
+    # stdio: no env var manipulation — per-project routing applies by default,
+    # and externally-set env vars (e.g. BASIC_MEMORY_FORCE_CLOUD) are honored.
 
     # Import mcp tools/prompts to register them with the server
     import basic_memory.mcp.tools  # noqa: F401  # pragma: no cover
@@ -69,6 +81,22 @@ def mcp(
         # Set env var with validated project name
         os.environ["BASIC_MEMORY_MCP_PROJECT"] = project_name
         logger.info(f"MCP server constrained to project: {project_name}")
+
+    def _run_background_auto_update() -> None:
+        result = run_auto_update(force=False, check_only=False, silent=True)
+        if result.restart_recommended:
+            logger.info(
+                "A newer Basic Memory version was installed and will apply on next restart."
+            )
+        elif result.status == AutoUpdateStatus.FAILED and result.error:
+            logger.warning(f"MCP background auto-update failed: {result.error}")
+
+    # Trigger: stdio transport corresponds to local user installs.
+    # Why: server transports (HTTP/SSE) run in managed environments where
+    # package-manager self-upgrades are inappropriate.
+    # Outcome: background auto-update runs only for local stdio MCP sessions.
+    if transport == "stdio":
+        threading.Thread(target=_run_background_auto_update, daemon=True).start()
 
     # Run the MCP server (blocks)
     # Lifespan handles: initialization, migrations, file sync, cleanup

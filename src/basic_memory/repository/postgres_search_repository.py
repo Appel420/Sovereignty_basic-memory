@@ -15,13 +15,22 @@ from basic_memory.config import BasicMemoryConfig, ConfigManager
 from basic_memory.repository.embedding_provider import EmbeddingProvider
 from basic_memory.repository.embedding_provider_factory import create_embedding_provider
 from basic_memory.repository.search_index_row import SearchIndexRow
-from basic_memory.repository.search_repository_base import SearchRepositoryBase
-from basic_memory.repository.metadata_filters import (
-    parse_metadata_filters,
-    build_postgres_json_path,
+from basic_memory.repository.search_repository_base import (
+    SearchRepositoryBase,
+    VectorChunkState,
 )
+from basic_memory.repository.metadata_filters import parse_metadata_filters
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
 from basic_memory.schemas.search import SearchItemType, SearchRetrievalMode
+
+
+def _strip_nul_from_row(row_data: dict) -> dict:
+    """Strip NUL bytes from all string values in a row dict.
+
+    Secondary defense: PostgreSQL text columns cannot store \\x00.
+    Primary sanitization happens in SearchService.index_entity_markdown().
+    """
+    return {k: v.replace("\x00", "") if isinstance(v, str) else v for k, v in row_data.items()}
 
 
 class PostgresSearchRepository(SearchRepositoryBase):
@@ -51,6 +60,13 @@ class PostgresSearchRepository(SearchRepositoryBase):
         self._app_config = app_config or ConfigManager().config
         self._semantic_enabled = self._app_config.semantic_search_enabled
         self._semantic_vector_k = self._app_config.semantic_vector_k
+        self._semantic_min_similarity = self._app_config.semantic_min_similarity
+        self._semantic_embedding_sync_batch_size = (
+            self._app_config.semantic_embedding_sync_batch_size
+        )
+        self._semantic_postgres_prepare_concurrency = (
+            self._app_config.semantic_postgres_prepare_concurrency
+        )
         self._embedding_provider = embedding_provider
         self._vector_dimensions = 384
         self._vector_tables_initialized = False
@@ -64,17 +80,16 @@ class PostgresSearchRepository(SearchRepositoryBase):
     async def init_search_index(self):
         """Create Postgres table with tsvector column and GIN indexes.
 
-        Note: This is handled by Alembic migrations. This method is a no-op
-        for Postgres as the schema is created via migrations.
+        Note: FTS schema is handled by Alembic migrations. Vector tables are
+        created here at startup so missing pgvector or provider errors surface
+        immediately.
         """
         logger.info("PostgreSQL search index initialization handled by migrations")
-        # Table creation is done via Alembic migrations
-        # This includes:
-        # - CREATE TABLE search_index (...)
-        # - ADD COLUMN textsearchable_index_col tsvector GENERATED ALWAYS AS (...)
-        # - CREATE INDEX USING GIN on textsearchable_index_col
-        # - CREATE INDEX USING GIN on metadata jsonb_path_ops
-        pass
+
+        # Fail fast: create vector tables at startup so missing pgvector
+        # or embedding provider errors surface immediately
+        if self._semantic_enabled:
+            await self._ensure_vector_tables()
 
     async def index_item(self, search_index_row: SearchIndexRow) -> None:
         """Index or update a single item using UPSERT.
@@ -92,6 +107,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             # Serialize JSON for raw SQL
             insert_data = search_index_row.to_insert(serialize_json=True)
             insert_data["project_id"] = self.project_id
+            insert_data = _strip_nul_from_row(insert_data)
 
             # Use upsert to handle race conditions during parallel indexing
             # ON CONFLICT (permalink, project_id) matches the partial unique index
@@ -260,6 +276,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
         if self._vector_tables_initialized:
             return
 
+        logger.debug("Ensuring Postgres vector tables exist for semantic search")
+
         async with self._vector_tables_lock:
             if self._vector_tables_initialized:
                 return
@@ -273,6 +291,10 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     ) from exc
 
                 # --- Chunks table (dimension-independent, may already exist via migration) ---
+                # Trigger: fresh Postgres projects may not have vector chunk tables yet.
+                # Why: runtime can bootstrap missing tables, but schema evolution must stay
+                # in Alembic to avoid concurrent ALTER TABLE deadlocks during indexing.
+                # Outcome: new installs create the current schema; upgrades rely on migration.
                 await session.execute(
                     text(
                         """
@@ -283,6 +305,8 @@ class PostgresSearchRepository(SearchRepositoryBase):
                             chunk_key TEXT NOT NULL,
                             chunk_text TEXT NOT NULL,
                             source_hash TEXT NOT NULL,
+                            entity_fingerprint TEXT NOT NULL,
+                            embedding_model TEXT NOT NULL,
                             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             UNIQUE (project_id, entity_id, chunk_key)
                         )
@@ -349,6 +373,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 )
                 await session.commit()
 
+            logger.debug(f"Postgres vector tables ready (dimensions={self._vector_dimensions})")
             self._vector_tables_initialized = True
 
     async def _get_existing_embedding_dims(self, session: AsyncSession) -> int | None:
@@ -411,7 +436,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     ORDER BY e.embedding <=> CAST(:query_embedding AS vector)
                     LIMIT :vector_k
                 )
-                SELECT c.entity_id, c.chunk_key, vector_matches.distance AS best_distance
+                SELECT c.entity_id, c.chunk_key, c.chunk_text, vector_matches.distance AS best_distance
                 FROM vector_matches
                 JOIN search_vector_chunks c ON c.id = vector_matches.chunk_id
                 WHERE c.project_id = :project_id
@@ -428,34 +453,114 @@ class PostgresSearchRepository(SearchRepositoryBase):
         )
         return [dict(row) for row in vector_result.mappings().all()]
 
+    def _vector_prepare_window_size(self) -> int:
+        """Use a bounded config-driven prepare window for Postgres vector sync."""
+        return self._semantic_postgres_prepare_concurrency
+
+    async def _upsert_scheduled_chunk_records(
+        self,
+        session: AsyncSession,
+        *,
+        entity_id: int,
+        scheduled_records: list[dict[str, str]],
+        existing_by_key: dict[str, VectorChunkState],
+        entity_fingerprint: str,
+        embedding_model: str,
+    ) -> list[tuple[int, str]]:
+        """Use Postgres UPSERT to rewrite only the scheduled chunk rows."""
+        if not scheduled_records:
+            return []
+
+        upsert_params: dict[str, object] = {
+            "project_id": self.project_id,
+            "entity_id": entity_id,
+        }
+        upsert_values: list[str] = []
+        # The SQL template is built from integer enumerate() indices only.
+        # No user-controlled text is interpolated into the statement.
+        for index, record in enumerate(scheduled_records):
+            upsert_params[f"chunk_key_{index}"] = record["chunk_key"]
+            upsert_params[f"chunk_text_{index}"] = record["chunk_text"]
+            upsert_params[f"source_hash_{index}"] = record["source_hash"]
+            upsert_params[f"entity_fingerprint_{index}"] = entity_fingerprint
+            upsert_params[f"embedding_model_{index}"] = embedding_model
+            upsert_values.append(
+                "("
+                ":entity_id, :project_id, "
+                f":chunk_key_{index}, :chunk_text_{index}, :source_hash_{index}, "
+                f":entity_fingerprint_{index}, :embedding_model_{index}, NOW()"
+                ")"
+            )
+
+        upsert_result = await session.execute(
+            text(f"""
+                INSERT INTO search_vector_chunks (
+                    entity_id,
+                    project_id,
+                    chunk_key,
+                    chunk_text,
+                    source_hash,
+                    entity_fingerprint,
+                    embedding_model,
+                    updated_at
+                ) VALUES {", ".join(upsert_values)}
+                ON CONFLICT (project_id, entity_id, chunk_key) DO UPDATE SET
+                    chunk_text = EXCLUDED.chunk_text,
+                    source_hash = EXCLUDED.source_hash,
+                    entity_fingerprint = EXCLUDED.entity_fingerprint,
+                    embedding_model = EXCLUDED.embedding_model,
+                    updated_at = NOW()
+                RETURNING id, chunk_key
+            """),
+            upsert_params,
+        )
+        upserted_ids_by_key = {
+            str(row["chunk_key"]): int(row["id"]) for row in upsert_result.mappings().all()
+        }
+        return [
+            (upserted_ids_by_key[record["chunk_key"]], record["chunk_text"])
+            for record in scheduled_records
+        ]
+
     async def _write_embeddings(
         self,
         session: AsyncSession,
         jobs: list[tuple[int, str]],
         embeddings: list[list[float]],
     ) -> None:
-        for (row_id, _), vector in zip(jobs, embeddings, strict=True):
-            vector_literal = self._format_pgvector_literal(vector)
-            await session.execute(
-                text(
-                    "INSERT INTO search_vector_embeddings ("
-                    "chunk_id, project_id, embedding, embedding_dims, updated_at"
-                    ") VALUES ("
-                    ":chunk_id, :project_id, CAST(:embedding AS vector), :embedding_dims, NOW()"
-                    ") "
-                    "ON CONFLICT (chunk_id) DO UPDATE SET "
-                    "project_id = EXCLUDED.project_id, "
-                    "embedding = EXCLUDED.embedding, "
-                    "embedding_dims = EXCLUDED.embedding_dims, "
-                    "updated_at = NOW()"
-                ),
-                {
-                    "chunk_id": row_id,
-                    "project_id": self.project_id,
-                    "embedding": vector_literal,
-                    "embedding_dims": len(vector),
-                },
+        params: dict[str, object] = {"project_id": self.project_id}
+        value_rows: list[str] = []
+
+        # The SQL template is built from integer enumerate() indices only.
+        # No user-controlled text is interpolated into the statement.
+        for index, ((row_id, _), vector) in enumerate(zip(jobs, embeddings, strict=True)):
+            params[f"chunk_id_{index}"] = row_id
+            params[f"embedding_{index}"] = self._format_pgvector_literal(vector)
+            params[f"embedding_dims_{index}"] = len(vector)
+            value_rows.append(
+                "("
+                f":chunk_id_{index}, :project_id, CAST(:embedding_{index} AS vector), "
+                f":embedding_dims_{index}, NOW()"
+                ")"
             )
+
+        await session.execute(
+            text(f"""
+                INSERT INTO search_vector_embeddings (
+                    chunk_id,
+                    project_id,
+                    embedding,
+                    embedding_dims,
+                    updated_at
+                ) VALUES {", ".join(value_rows)}
+                ON CONFLICT (chunk_id) DO UPDATE SET
+                    project_id = EXCLUDED.project_id,
+                    embedding = EXCLUDED.embedding,
+                    embedding_dims = EXCLUDED.embedding_dims,
+                    updated_at = NOW()
+            """),
+            params,
+        )
 
     async def _delete_entity_chunks(
         self,
@@ -493,8 +598,13 @@ class PostgresSearchRepository(SearchRepositoryBase):
             stale_params,
         )
 
-    async def _update_timestamp_sql(self) -> str:
-        return "NOW()"  # pragma: no cover
+    def _distance_to_similarity(self, distance: float) -> float:
+        """Convert pgvector cosine distance to cosine similarity.
+
+        pgvector's <=> operator returns cosine distance in [0, 2],
+        where cos_distance = 1 - cos_similarity.
+        """
+        return max(0.0, 1.0 - distance)
 
     def _timestamp_now_expr(self) -> str:
         return "NOW()"
@@ -530,7 +640,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
             for row in search_index_rows:
                 insert_data = row.to_insert(serialize_json=True)
                 insert_data["project_id"] = self.project_id
-                insert_data_list.append(insert_data)
+                insert_data_list.append(_strip_nul_from_row(insert_data))
 
             # Use upsert to handle race conditions during parallel indexing
             # ON CONFLICT (permalink, project_id) matches the partial unique index
@@ -576,39 +686,28 @@ class PostgresSearchRepository(SearchRepositoryBase):
     # FTS search (Postgres-specific)
     # ------------------------------------------------------------------
 
-    async def search(
+    @staticmethod
+    def _is_tsquery_syntax_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        return (
+            "syntax error in tsquery" in msg
+            or "invalid input syntax for type tsquery" in msg
+            or "no operand in tsquery" in msg
+            or "no operator in tsquery" in msg
+        )
+
+    async def _build_fts_query_parts(
         self,
         search_text: Optional[str] = None,
         permalink: Optional[str] = None,
         permalink_match: Optional[str] = None,
         title: Optional[str] = None,
-        types: Optional[List[str]] = None,
+        note_types: Optional[List[str]] = None,
         after_date: Optional[datetime] = None,
         search_item_types: Optional[List[SearchItemType]] = None,
         metadata_filters: Optional[dict] = None,
-        retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
-        limit: int = 10,
-        offset: int = 0,
-    ) -> List[SearchIndexRow]:
-        """Search across all indexed content using PostgreSQL tsvector."""
-        # --- Dispatch vector / hybrid modes (shared logic) ---
-        dispatched = await self._dispatch_retrieval_mode(
-            search_text=search_text,
-            permalink=permalink,
-            permalink_match=permalink_match,
-            title=title,
-            types=types,
-            after_date=after_date,
-            search_item_types=search_item_types,
-            metadata_filters=metadata_filters,
-            retrieval_mode=retrieval_mode,
-            limit=limit,
-            offset=offset,
-        )
-        if dispatched is not None:
-            return dispatched
-
-        # --- FTS mode (Postgres-specific) ---
+    ) -> tuple[str, str, dict, str, str]:
+        """Build Postgres FTS FROM/WHERE params shared by search and count."""
         conditions = []
         params = {}
         order_by_clause = ""
@@ -654,39 +753,50 @@ class PostgresSearchRepository(SearchRepositoryBase):
             else:
                 conditions.append("search_index.permalink = :permalink")
 
-        # Handle search item type filter
+        # Handle search item type filter (parameterized for defense-in-depth)
         if search_item_types:
-            type_list = ", ".join(f"'{t.value}'" for t in search_item_types)
-            conditions.append(f"search_index.type IN ({type_list})")
+            type_placeholders = []
+            for idx, t in enumerate(search_item_types):
+                param_name = f"search_type_{idx}"
+                params[param_name] = t.value
+                type_placeholders.append(f":{param_name}")
+            conditions.append(f"search_index.type IN ({', '.join(type_placeholders)})")
 
-        # Handle entity type filter using JSONB containment
-        if types:
-            # Use JSONB @> operator for efficient containment queries
+        # Handle note type filter using JSONB containment (parameterized)
+        if note_types:
             type_conditions = []
-            for entity_type in types:
-                # Create JSONB containment condition for each type
-                type_conditions.append(
-                    f'search_index.metadata @> \'{{"entity_type": "{entity_type}"}}\''
-                )
+            for idx, note_type in enumerate(note_types):
+                param_name = f"note_type_{idx}"
+                params[param_name] = json.dumps({"note_type": note_type})
+                type_conditions.append(f"search_index.metadata @> CAST(:{param_name} AS jsonb)")
             conditions.append(f"({' OR '.join(type_conditions)})")
 
         # Handle date filter
         if after_date:
             params["after_date"] = after_date
-            conditions.append("search_index.created_at > :after_date")
+            # Filter on updated_at so recently-edited notes are included even when created_at is old
+            conditions.append("search_index.updated_at > :after_date")
             # order by most recent first
             order_by_clause = ", search_index.updated_at DESC"
 
         # Handle structured metadata filters (frontmatter)
+        # Uses jsonb_extract_path_text() / jsonb_extract_path() with parameterized
+        # path parts instead of #>> / #> with interpolated paths.
         if metadata_filters:
             parsed_filters = parse_metadata_filters(metadata_filters)
             from_clause = "search_index JOIN entity ON search_index.entity_id = entity.id"
             metadata_expr = "entity.entity_metadata::jsonb"
 
             for idx, filt in enumerate(parsed_filters):
-                path = build_postgres_json_path(filt.path_parts)
-                text_expr = f"({metadata_expr} #>> '{path}')"
-                json_expr = f"({metadata_expr} #> '{path}')"
+                # Parameterize each JSON path part individually
+                path_param_names = []
+                for j, part in enumerate(filt.path_parts):
+                    path_param = f"meta_path_{idx}_{j}"
+                    params[path_param] = part
+                    path_param_names.append(f":{path_param}")
+                path_args = ", ".join(path_param_names)
+                text_expr = f"jsonb_extract_path_text({metadata_expr}, {path_args})"
+                json_expr = f"jsonb_extract_path({metadata_expr}, {path_args})"
 
                 if filt.op == "eq":
                     value_param = f"meta_val_{idx}"
@@ -704,14 +814,12 @@ class PostgresSearchRepository(SearchRepositoryBase):
                     continue
 
                 if filt.op == "contains":
-                    import json as _json
-
                     base_param = f"meta_val_{idx}"
                     tag_conditions = []
                     # Require all values to be present
                     for j, val in enumerate(filt.value):
                         tag_param = f"{base_param}_{j}"
-                        params[tag_param] = _json.dumps([val])
+                        params[tag_param] = json.dumps([val])
                         like_param = f"{base_param}_{j}_like"
                         params[like_param] = f'%"{val}"%'
                         like_param_single = f"{base_param}_{j}_like_single"
@@ -726,7 +834,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
 
                 if filt.op in {"gt", "gte", "lt", "lte", "between"}:
                     compare_expr = (
-                        f"({metadata_expr} #>> '{path}')::double precision"
+                        f"{text_expr}::double precision"
                         if filt.comparison == "numeric"
                         else text_expr
                     )
@@ -748,10 +856,6 @@ class PostgresSearchRepository(SearchRepositoryBase):
         params["project_id"] = self.project_id
         conditions.append("search_index.project_id = :project_id")
 
-        # set limit and offset
-        params["limit"] = limit
-        params["offset"] = offset
-
         # Build WHERE clause
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
@@ -763,6 +867,64 @@ class PostgresSearchRepository(SearchRepositoryBase):
             )
         else:
             score_expr = "0"
+
+        return from_clause, where_clause, params, order_by_clause, score_expr
+
+    async def search(
+        self,
+        search_text: Optional[str] = None,
+        permalink: Optional[str] = None,
+        permalink_match: Optional[str] = None,
+        title: Optional[str] = None,
+        note_types: Optional[List[str]] = None,
+        after_date: Optional[datetime] = None,
+        search_item_types: Optional[List[SearchItemType]] = None,
+        metadata_filters: Optional[dict] = None,
+        retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
+        min_similarity: Optional[float] = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> List[SearchIndexRow]:
+        """Search across all indexed content using PostgreSQL tsvector."""
+        # --- Dispatch vector / hybrid modes (shared logic) ---
+        dispatched = await self._dispatch_retrieval_mode(
+            search_text=search_text,
+            permalink=permalink,
+            permalink_match=permalink_match,
+            title=title,
+            note_types=note_types,
+            after_date=after_date,
+            search_item_types=search_item_types,
+            metadata_filters=metadata_filters,
+            retrieval_mode=retrieval_mode,
+            min_similarity=min_similarity,
+            limit=limit,
+            offset=offset,
+        )
+        if dispatched is not None:
+            return dispatched
+
+        # --- FTS mode (Postgres-specific) ---
+        (
+            from_clause,
+            where_clause,
+            params,
+            order_by_clause,
+            score_expr,
+        ) = await self._build_fts_query_parts(
+            search_text=search_text,
+            permalink=permalink,
+            permalink_match=permalink_match,
+            title=title,
+            note_types=note_types,
+            after_date=after_date,
+            search_item_types=search_item_types,
+            metadata_filters=metadata_filters,
+        )
+
+        # set limit and offset
+        params["limit"] = limit
+        params["offset"] = offset
 
         sql = f"""
             SELECT
@@ -784,7 +946,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 {score_expr} as score
             FROM {from_clause}
             WHERE {where_clause}
-            ORDER BY score DESC, search_index.id ASC {order_by_clause}
+            ORDER BY score DESC {order_by_clause}, search_index.id ASC
             LIMIT :limit
             OFFSET :offset
         """
@@ -795,17 +957,7 @@ class PostgresSearchRepository(SearchRepositoryBase):
                 result = await session.execute(text(sql), params)
                 rows = result.fetchall()
         except Exception as e:
-            # Handle tsquery syntax errors (and only those).
-            #
-            # Important: Postgres errors for other failures (e.g. missing table) will still mention
-            # `to_tsquery(...)` in the SQL text, so checking for the substring "tsquery" is too broad.
-            msg = str(e).lower()
-            if (
-                "syntax error in tsquery" in msg
-                or "invalid input syntax for type tsquery" in msg
-                or "no operand in tsquery" in msg
-                or "no operator in tsquery" in msg
-            ):
+            if self._is_tsquery_syntax_error(e):
                 logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")
                 return []
 
@@ -846,3 +998,60 @@ class PostgresSearchRepository(SearchRepositoryBase):
             )
 
         return results
+
+    async def count(
+        self,
+        search_text: Optional[str] = None,
+        permalink: Optional[str] = None,
+        permalink_match: Optional[str] = None,
+        title: Optional[str] = None,
+        note_types: Optional[List[str]] = None,
+        after_date: Optional[datetime] = None,
+        search_item_types: Optional[List[SearchItemType]] = None,
+        metadata_filters: Optional[dict] = None,
+        retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS,
+        min_similarity: Optional[float] = None,
+    ) -> int:
+        """Count indexed content matching the Postgres FTS query."""
+        if retrieval_mode != SearchRetrievalMode.FTS:
+            return await super().count(
+                search_text=search_text,
+                permalink=permalink,
+                permalink_match=permalink_match,
+                title=title,
+                note_types=note_types,
+                after_date=after_date,
+                search_item_types=search_item_types,
+                metadata_filters=metadata_filters,
+                retrieval_mode=retrieval_mode,
+                min_similarity=min_similarity,
+            )
+
+        (
+            from_clause,
+            where_clause,
+            params,
+            _order_by_clause,
+            _score_expr,
+        ) = await self._build_fts_query_parts(
+            search_text=search_text,
+            permalink=permalink,
+            permalink_match=permalink_match,
+            title=title,
+            note_types=note_types,
+            after_date=after_date,
+            search_item_types=search_item_types,
+            metadata_filters=metadata_filters,
+        )
+        sql = f"SELECT COUNT(*) FROM {from_clause} WHERE {where_clause}"
+        logger.trace(f"Count {sql} params: {params}")
+        try:
+            async with db.scoped_session(self.session_maker) as session:
+                result = await session.execute(text(sql), params)
+                return int(result.scalar_one())
+        except Exception as e:
+            if self._is_tsquery_syntax_error(e):
+                logger.warning(f"tsquery syntax error for search term: {search_text}, error: {e}")
+                return 0
+            logger.error(f"Database error during search count: {e}")
+            raise

@@ -1,12 +1,14 @@
 """Tests for search service."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import text
 
 from basic_memory import db
-from basic_memory.schemas.search import SearchQuery, SearchItemType
+from basic_memory.repository.search_index_row import SearchIndexRow
+from basic_memory.schemas.search import SearchQuery, SearchItemType, SearchRetrievalMode
+from basic_memory.services.search_service import _strip_nul
 
 
 @pytest.mark.asyncio
@@ -150,12 +152,12 @@ async def test_filters(search_service, test_graph):
     """Test search filters."""
     # Combined filters
     results = await search_service.search(
-        SearchQuery(text="Deep", entity_types=[SearchItemType.ENTITY], types=["deep"])
+        SearchQuery(text="Deep", entity_types=[SearchItemType.ENTITY], note_types=["deep"])
     )
     assert len(results) == 1
     for r in results:
         assert r.type == SearchItemType.ENTITY
-        assert r.metadata.get("entity_type") == "deep"
+        assert r.metadata.get("note_type") == "deep"
 
 
 @pytest.mark.asyncio
@@ -172,12 +174,12 @@ async def test_after_date(search_service, test_graph):
     )
     for r in results:
         # Handle both string (SQLite) and datetime (Postgres) formats
-        created_at = (
-            r.created_at
-            if isinstance(r.created_at, datetime)
-            else datetime.fromisoformat(r.created_at)
+        updated_at = (
+            r.updated_at
+            if isinstance(r.updated_at, datetime)
+            else datetime.fromisoformat(r.updated_at)
         )
-        assert created_at > past_date
+        assert updated_at > past_date
 
     # Should not find with future date
     future_date = datetime(2030, 1, 1).astimezone()
@@ -191,11 +193,74 @@ async def test_after_date(search_service, test_graph):
 
 
 @pytest.mark.asyncio
+async def test_after_date_uses_updated_at(search_service):
+    """Regression: after_date should filter on updated_at, not created_at.
+
+    An entity created before the timeframe but updated within it must appear
+    in recent-activity results. A stale entity (updated_at also old) must not.
+    """
+    cutoff = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    old_created = datetime(2015, 6, 1, tzinfo=timezone.utc)
+    recently_updated = datetime(2023, 3, 15, tzinfo=timezone.utc)
+    stale_updated = datetime(2018, 6, 1, tzinfo=timezone.utc)
+
+    project_id = search_service.repository.project_id
+
+    # Leave metadata at its None default — SearchIndexRow.to_insert only
+    # JSON-serializes truthy metadata, so passing {} would slip an
+    # un-serialized dict into the SQLite bind and raise ProgrammingError.
+    recently_updated_row = SearchIndexRow(
+        project_id=project_id,
+        id=99001,
+        type="entity",
+        file_path="test/recently_updated.md",
+        title="Recently Updated Entity",
+        content_snippet="recently updated content",
+        permalink="test/recently-updated-entity",
+        created_at=old_created,
+        updated_at=recently_updated,
+    )
+    stale_row = SearchIndexRow(
+        project_id=project_id,
+        id=99002,
+        type="entity",
+        file_path="test/stale.md",
+        title="Stale Entity",
+        content_snippet="stale content",
+        permalink="test/stale-entity",
+        created_at=old_created,
+        updated_at=stale_updated,
+    )
+
+    await search_service.repository.index_item(recently_updated_row)
+    await search_service.repository.index_item(stale_row)
+
+    results = await search_service.search(SearchQuery(after_date=cutoff.isoformat()))
+
+    permalinks = {r.permalink for r in results}
+    # recently-updated entity must appear despite old created_at
+    assert "test/recently-updated-entity" in permalinks
+    # stale entity must not appear (updated_at is before cutoff)
+    assert "test/stale-entity" not in permalinks
+
+    # results should be ordered newest updated_at first
+    updated_ats = []
+    for r in results:
+        ua = (
+            r.updated_at
+            if isinstance(r.updated_at, datetime)
+            else datetime.fromisoformat(r.updated_at)
+        )
+        updated_ats.append(ua.replace(tzinfo=timezone.utc) if ua.tzinfo is None else ua)
+    assert updated_ats == sorted(updated_ats, reverse=True)
+
+
+@pytest.mark.asyncio
 async def test_search_type(search_service, test_graph):
     """Test search filters."""
 
     # Should find only type
-    results = await search_service.search(SearchQuery(types=["test"]))
+    results = await search_service.search(SearchQuery(note_types=["test"]))
     assert len(results) > 0
     for r in results:
         assert r.type == SearchItemType.ENTITY
@@ -220,7 +285,7 @@ async def test_extract_entity_tags_exception_handling(search_service):
     # Create entity with string tags that will cause parsing to fail and fall back to single tag
     entity_with_invalid_tags = Entity(
         title="Test Entity",
-        entity_type="test",
+        note_type="test",
         entity_metadata={"tags": "just a string"},  # This will fail ast.literal_eval
         content_type="text/markdown",
         file_path="test/test-entity.md",
@@ -234,7 +299,7 @@ async def test_extract_entity_tags_exception_handling(search_service):
     # Test with empty string (should return empty list) - covers line 149
     entity_with_empty_tags = Entity(
         title="Test Entity Empty",
-        entity_type="test",
+        note_type="test",
         entity_metadata={"tags": ""},
         content_type="text/markdown",
         file_path="test/test-entity-empty.md",
@@ -254,6 +319,38 @@ async def test_delete_entity_without_permalink(search_service, sample_entity):
 
     # This should trigger the delete_by_entity_id path (line 355) in handle_delete
     await search_service.handle_delete(sample_entity)
+
+
+@pytest.mark.asyncio
+async def test_handle_delete_clears_entity_vectors(search_service, sample_entity, monkeypatch):
+    """Regression guard for #764: handle_delete must drive vector-row cleanup
+    so deleting an entity doesn't leave orphaned rows in `search_vector_chunks`
+    or `search_vector_embeddings`.
+
+    Verified by spying on the repository's `delete_entity_vector_rows`. The
+    short-circuit path inside `_clear_entity_vectors` (semantic disabled) is
+    bypassed by forcing `_semantic_enabled=True` so we exercise the real
+    delegation, not the no-op branch.
+    """
+    calls: list[int] = []
+
+    async def spy_delete_entity_vector_rows(entity_id: int) -> None:
+        calls.append(entity_id)
+
+    # Force the cleanup path even if the test repo is configured without
+    # semantic enabled — we're asserting the wiring, not embedding behavior.
+    monkeypatch.setattr(search_service.repository, "_semantic_enabled", True)
+    monkeypatch.setattr(
+        search_service.repository,
+        "delete_entity_vector_rows",
+        spy_delete_entity_vector_rows,
+    )
+
+    await search_service.handle_delete(sample_entity)
+
+    assert calls == [sample_entity.id], (
+        f"handle_delete must call delete_entity_vector_rows({sample_entity.id}); got calls={calls}"
+    )
 
 
 @pytest.mark.asyncio
@@ -411,6 +508,143 @@ async def test_boolean_operators_detection(search_service):
         )
 
 
+@pytest.mark.asyncio
+async def test_plain_multiterm_fts_retries_with_relaxed_or_when_strict_empty(
+    search_service, monkeypatch
+):
+    """Plain multi-term FTS should retry with relaxed OR query after strict no-results."""
+    call_texts: list[str | None] = []
+
+    now = datetime.now().astimezone()
+    fallback_row = SearchIndexRow(
+        project_id=1,
+        id=1,
+        type=SearchItemType.ENTITY.value,
+        file_path="test/fallback.md",
+        created_at=now,
+        updated_at=now,
+        permalink="test/fallback",
+        metadata={"note_type": "note"},
+        title="Fallback Match",
+        score=1.0,
+    )
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        if len(call_texts) == 1:
+            return []
+        return [fallback_row]
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    results = await search_service.search(
+        SearchQuery(text="fundraising venture capital", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert len(results) == 1
+    assert call_texts[0] == "fundraising venture capital"
+    assert call_texts[1] == "fundraising OR venture OR capital"
+    assert len(call_texts) == 2
+
+
+@pytest.mark.asyncio
+async def test_relaxed_query_prunes_stopwords(search_service):
+    """Relaxed query should remove stopwords and keep high-signal terms."""
+    relaxed = search_service._build_relaxed_fts_query("who are our main competitors and partners?")
+    assert relaxed == "main OR competitors OR partners"
+
+
+@pytest.mark.asyncio
+async def test_no_relax_for_explicit_boolean_query(search_service, monkeypatch):
+    """Explicit boolean query should remain strict and avoid fallback retries."""
+    call_texts: list[str | None] = []
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        return []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    await search_service.search(
+        SearchQuery(text="term1 AND term2", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert call_texts == ["term1 AND term2"]
+
+
+@pytest.mark.asyncio
+async def test_no_relax_for_quoted_phrase_query(search_service, monkeypatch):
+    """Quoted phrase query should remain strict and avoid fallback retries."""
+    call_texts: list[str | None] = []
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        return []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    await search_service.search(
+        SearchQuery(text='"weekly standup"', retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert call_texts == ['"weekly standup"']
+
+
+@pytest.mark.asyncio
+async def test_no_relax_for_two_term_query(search_service, monkeypatch):
+    """Two-term queries should remain strict to avoid short-query false positives."""
+    call_texts: list[str | None] = []
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        return []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    await search_service.search(
+        SearchQuery(text="new feature", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert call_texts == ["new feature"]
+
+
+@pytest.mark.asyncio
+async def test_no_relax_for_numeric_identifier_query(search_service, monkeypatch):
+    """Queries with numeric identifiers should remain strict to avoid OR over-broadening."""
+    call_texts: list[str | None] = []
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        return []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    await search_service.search(
+        SearchQuery(text="root note 1", retrieval_mode=SearchRetrievalMode.FTS)
+    )
+
+    assert call_texts == ["root note 1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retrieval_mode", [SearchRetrievalMode.VECTOR, SearchRetrievalMode.HYBRID])
+async def test_no_relax_for_vector_or_hybrid_modes(search_service, monkeypatch, retrieval_mode):
+    """Vector and hybrid modes should never run the FTS fallback retry path."""
+    call_texts: list[str | None] = []
+
+    async def fake_search(**kwargs):
+        call_texts.append(kwargs.get("search_text"))
+        return []
+
+    monkeypatch.setattr(search_service.repository, "search", fake_search)
+
+    await search_service.search(
+        SearchQuery(text="who are our competitors", retrieval_mode=retrieval_mode)
+    )
+
+    assert call_texts == ["who are our competitors"]
+
+
 # Tests for frontmatter tag search functionality
 
 
@@ -421,7 +655,7 @@ async def test_extract_entity_tags_list_format(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata={"tags": ["business", "strategy", "planning"]},
         content_type="text/markdown",
         file_path="test/business-strategy.md",
@@ -439,7 +673,7 @@ async def test_extract_entity_tags_string_format(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata={"tags": "['documentation', 'tools', 'best-practices']"},
         content_type="text/markdown",
         file_path="test/docs.md",
@@ -457,7 +691,7 @@ async def test_extract_entity_tags_empty_list(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata={"tags": []},
         content_type="text/markdown",
         file_path="test/empty-tags.md",
@@ -475,7 +709,7 @@ async def test_extract_entity_tags_empty_string(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata={"tags": "[]"},
         content_type="text/markdown",
         file_path="test/empty-string-tags.md",
@@ -493,7 +727,7 @@ async def test_extract_entity_tags_no_metadata(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata=None,
         content_type="text/markdown",
         file_path="test/no-metadata.md",
@@ -511,7 +745,7 @@ async def test_extract_entity_tags_no_tags_key(search_service, session_maker):
 
     entity = Entity(
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         entity_metadata={"title": "Some Title", "type": "note"},
         content_type="text/markdown",
         file_path="test/no-tags-key.md",
@@ -531,7 +765,7 @@ async def test_search_tag_prefix_maps_to_tags_filter(search_service, entity_serv
         EntitySchema(
             title="Tagged Note Missing",
             directory="tags",
-            entity_type="note",
+            note_type="note",
             content="# Tagged Note",
             entity_metadata={"tags": ["tier1", "alpha"]},
         )
@@ -553,7 +787,7 @@ async def test_search_tag_prefix_with_nonexistent_tag_returns_empty(search_servi
         EntitySchema(
             title="Tagged Note",
             directory="tags",
-            entity_type="note",
+            note_type="note",
             content="# Tagged Note",
             entity_metadata={"tags": ["tier1", "alpha"]},
         )
@@ -575,7 +809,7 @@ async def test_search_tag_prefix_multiple_tags_requires_all(search_service, enti
         EntitySchema(
             title="Multi Tagged Note",
             directory="tags/multi",
-            entity_type="note",
+            note_type="note",
             content="# Tagged Note",
             entity_metadata={"tags": ["tier1", "alpha"]},
         )
@@ -600,7 +834,7 @@ async def test_search_by_frontmatter_tags(search_service, session_maker, test_pr
 
     entity_data = {
         "title": "Business Strategy Guide",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {"tags": ["business", "strategy", "planning", "organization"]},
         "content_type": "text/markdown",
         "file_path": "guides/business-strategy.md",
@@ -652,7 +886,7 @@ async def test_search_by_frontmatter_tags_string_format(
 
     entity_data = {
         "title": "Documentation Guidelines",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {"tags": "['documentation', 'tools', 'best-practices']"},
         "content_type": "text/markdown",
         "file_path": "guides/documentation.md",
@@ -705,7 +939,7 @@ async def test_search_special_characters_in_title(search_service, session_maker,
 
         entity_data = {
             "title": title,
-            "entity_type": "note",
+            "note_type": "note",
             "entity_metadata": {"tags": ["special", "characters"]},
             "content_type": "text/markdown",
             "file_path": f"special/{title}.md",
@@ -748,7 +982,7 @@ async def test_search_title_with_parentheses_specific(search_service, session_ma
 
     entity_data = {
         "title": "Note (with parentheses)",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {"tags": ["test"]},
         "content_type": "text/markdown",
         "file_path": "special/Note (with parentheses).md",
@@ -784,7 +1018,7 @@ async def test_search_title_via_repository_direct(search_service, session_maker,
 
     entity_data = {
         "title": "Note (with parentheses)",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {"tags": ["test"]},
         "content_type": "text/markdown",
         "file_path": "special/Note (with parentheses).md",
@@ -832,7 +1066,7 @@ async def test_index_entity_with_duplicate_observations(
     # Create entity
     entity_data = {
         "title": "Entity With Duplicate Observations",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {},
         "content_type": "text/markdown",
         "file_path": "test/duplicate-obs.md",
@@ -855,6 +1089,7 @@ async def test_index_entity_with_duplicate_observations(
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
     entity = await entity_repo.get_by_permalink("test/duplicate-obs")
+    assert entity is not None
 
     # Verify we have duplicate observations
     assert len(entity.observations) == 2
@@ -887,7 +1122,7 @@ async def test_index_entity_dedupes_observations_by_permalink(
     # Create entity
     entity_data = {
         "title": "Dedupe Test Entity",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {},
         "content_type": "text/markdown",
         "file_path": "test/dedupe-test.md",
@@ -913,6 +1148,7 @@ async def test_index_entity_dedupes_observations_by_permalink(
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
     entity = await entity_repo.get_by_permalink("test/dedupe-test")
+    assert entity is not None
     assert len(entity.observations) == 3
 
     # Index the entity
@@ -945,7 +1181,7 @@ async def test_index_entity_multiple_categories_same_content(
     # Create entity
     entity_data = {
         "title": "Multi Category Entity",
-        "entity_type": "note",
+        "note_type": "note",
         "entity_metadata": {},
         "content_type": "text/markdown",
         "file_path": "test/multi-category.md",
@@ -964,6 +1200,7 @@ async def test_index_entity_multiple_categories_same_content(
 
     # Reload entity with observations (get_by_permalink eagerly loads observations)
     entity = await entity_repo.get_by_permalink("test/multi-category")
+    assert entity is not None
     assert len(entity.observations) == 2
 
     # Verify permalinks are different due to different categories
@@ -978,20 +1215,77 @@ async def test_index_entity_multiple_categories_same_content(
     assert len(results) >= 2
 
 
+# Tests for NUL byte stripping
+
+
+def test_strip_nul_removes_nul_bytes():
+    """_strip_nul removes \\x00 from strings."""
+    assert _strip_nul("hello\x00world") == "helloworld"
+    assert _strip_nul("\x00\x00\x00") == ""
+    assert _strip_nul("clean string") == "clean string"
+
+
 @pytest.mark.asyncio
-async def test_reindex_vectors(search_service, session_maker, test_project):
+async def test_index_entity_markdown_strips_nul_bytes(search_service, session_maker, test_project):
+    """Content with NUL bytes should be stripped before indexing.
+
+    rclone preallocation on virtual filesystems (e.g. Google Drive File Stream)
+    can pad files with \\x00 bytes, causing PostgreSQL CharacterNotInRepertoireError.
+
+    Note: NUL bytes arrive via file content read from disk, not from the database.
+    Postgres rejects \\x00 in text columns at the ORM level, so we only test
+    the content path (passed to index_entity) rather than observation creation.
+    """
+    from basic_memory.repository import EntityRepository
+    from basic_memory.repository.search_repository import SearchRepository
+
+    entity_repo = EntityRepository(session_maker, project_id=test_project.id)
+
+    entity_data = {
+        "title": "NUL Test Entity",
+        "note_type": "note",
+        "entity_metadata": {},
+        "content_type": "text/markdown",
+        "file_path": "test/nul-test.md",
+        "permalink": "test/nul-test",
+        "project_id": test_project.id,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+    }
+    entity = await entity_repo.create(entity_data)
+    entity = await entity_repo.get_by_permalink("test/nul-test")
+    assert entity is not None
+
+    # Index with NUL-containing content (simulates rclone-preallocated file)
+    nul_content = "# NUL Test\x00\x00\nSome content\x00here"
+    await search_service.index_entity(entity, content=nul_content)
+
+    # Verify no NUL bytes in stored search index rows
+    search_repo: SearchRepository = search_service.repository
+    results = await search_repo.search(permalink_match="test/nul-test*")
+    for row in results:
+        if row.content_snippet:
+            assert "\x00" not in row.content_snippet, (
+                f"NUL found in content_snippet for {row.permalink}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_reindex_vectors(search_service, session_maker, test_project, monkeypatch):
     """Test that reindex_vectors processes all entities and reports stats."""
     from basic_memory.repository import EntityRepository
+    from basic_memory.repository.search_repository_base import VectorSyncBatchResult
     from datetime import datetime
 
     entity_repo = EntityRepository(session_maker, project_id=test_project.id)
 
     # Create some entities
+    created_entity_ids: list[int] = []
     for i in range(3):
         entity = await entity_repo.create(
             {
                 "title": f"Vector Test Entity {i}",
-                "entity_type": "note",
+                "note_type": "note",
                 "entity_metadata": {},
                 "content_type": "text/markdown",
                 "file_path": f"test/vector-test-{i}.md",
@@ -1001,7 +1295,29 @@ async def test_reindex_vectors(search_service, session_maker, test_project):
                 "updated_at": datetime.now(),
             }
         )
+        created_entity_ids.append(entity.id)
         await search_service.index_entity(entity, content=f"Content for entity {i}")
+
+    async def _stub_sync_entity_vectors_batch(entity_ids: list[int], progress_callback=None):
+        assert entity_ids == created_entity_ids
+        if progress_callback:
+            for i, entity_id in enumerate(entity_ids):
+                progress_callback(entity_id, i + 1, len(entity_ids))
+        return VectorSyncBatchResult(
+            entities_total=len(entity_ids),
+            entities_synced=len(entity_ids),
+            entities_failed=0,
+            failed_entity_ids=[],
+            embedding_jobs_total=9,
+            embed_seconds_total=1.2,
+            write_seconds_total=0.4,
+        )
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "sync_entity_vectors_batch",
+        _stub_sync_entity_vectors_batch,
+    )
 
     # Track progress calls
     progress_calls = []
@@ -1019,21 +1335,24 @@ async def test_reindex_vectors(search_service, session_maker, test_project):
     assert len(progress_calls) == stats["total_entities"]
     # Progress indices should be sequential
     for i, (_, index, total) in enumerate(progress_calls):
-        assert index == i
+        assert index == i + 1
         assert total == stats["total_entities"]
 
 
 @pytest.mark.asyncio
-async def test_reindex_vectors_no_callback(search_service, session_maker, test_project):
+async def test_reindex_vectors_no_callback(
+    search_service, session_maker, test_project, monkeypatch
+):
     """Test reindex_vectors works without a progress callback."""
     from basic_memory.repository import EntityRepository
+    from basic_memory.repository.search_repository_base import VectorSyncBatchResult
     from datetime import datetime
 
     entity_repo = EntityRepository(session_maker, project_id=test_project.id)
     entity = await entity_repo.create(
         {
             "title": "No Callback Entity",
-            "entity_type": "note",
+            "note_type": "note",
             "entity_metadata": {},
             "content_type": "text/markdown",
             "file_path": "test/no-callback.md",
@@ -1044,6 +1363,24 @@ async def test_reindex_vectors_no_callback(search_service, session_maker, test_p
         }
     )
     await search_service.index_entity(entity, content="Test content")
+
+    async def _stub_sync_entity_vectors_batch(entity_ids: list[int], progress_callback=None):
+        assert progress_callback is None
+        return VectorSyncBatchResult(
+            entities_total=len(entity_ids),
+            entities_synced=len(entity_ids),
+            entities_failed=0,
+            failed_entity_ids=[],
+            embedding_jobs_total=3,
+            embed_seconds_total=0.5,
+            write_seconds_total=0.1,
+        )
+
+    monkeypatch.setattr(
+        search_service.repository,
+        "sync_entity_vectors_batch",
+        _stub_sync_entity_vectors_batch,
+    )
 
     stats = await search_service.reindex_vectors()
     assert stats["total_entities"] >= 1

@@ -4,25 +4,32 @@ This tool creates Obsidian canvas files (.canvas) using the JSON Canvas 1.0 spec
 """
 
 import json
-from typing import Dict, List, Any, Optional
+from typing import Annotated, Dict, List, Any, Optional
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import AliasChoices, BeforeValidator, Field
 
 from basic_memory.mcp.project_context import get_project_client
+from basic_memory.utils import coerce_list
 from basic_memory.mcp.server import mcp
 from basic_memory.mcp.tools.utils import call_put, call_post, resolve_entity_id
 
 
 @mcp.tool(
     description="Create an Obsidian canvas file to visualize concepts and connections.",
+    annotations={"destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def canvas(
-    nodes: List[Dict[str, Any]],
-    edges: List[Dict[str, Any]],
+    nodes: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
+    edges: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
     title: str,
-    directory: str,
+    directory: Annotated[
+        str,
+        Field(validation_alias=AliasChoices("directory", "folder", "dir", "path")),
+    ],
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
     context: Context | None = None,
 ) -> str:
     """Create an Obsidian canvas file with the provided nodes and edges.
@@ -39,6 +46,9 @@ async def canvas(
     Args:
         project: Project name to create canvas in. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
+        project_id: Project external_id (UUID). Prefer this over `project` when known —
+                it routes to the exact project regardless of name collisions across cloud
+                workspaces. Takes precedence over `project`. Get from list_memory_projects().
         nodes: List of node objects following JSON Canvas 1.0 spec
         edges: List of edge objects following JSON Canvas 1.0 spec
         title: The title of the canvas (will be saved as title.canvas)
@@ -93,7 +103,10 @@ async def canvas(
     Raises:
         ToolError: If project doesn't exist or directory path is invalid
     """
-    async with get_project_client(project, context) as (client, active_project):
+    async with get_project_client(project, context=context, project_id=project_id) as (
+        client,
+        active_project,
+    ):
         # Ensure path has .canvas extension
         file_title = title if title.endswith(".canvas") else f"{title}.canvas"
         file_path = f"{directory}/{file_title}"

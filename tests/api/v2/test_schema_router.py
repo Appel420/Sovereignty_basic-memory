@@ -7,6 +7,7 @@ Note: EntityType uses BeforeValidator(to_snake_case) so "Person" becomes "person
 in the database. All query params must use the stored (snake_case) form.
 """
 
+from pathlib import Path
 from textwrap import dedent
 
 import pytest
@@ -14,6 +15,7 @@ from httpx import AsyncClient
 
 from basic_memory.models import Project
 from basic_memory.schemas.base import Entity as EntitySchema
+from basic_memory.services.file_service import FileService
 
 
 # --- Helpers ---
@@ -28,7 +30,7 @@ async def create_person_entities(entity_service, search_service):
         EntitySchema(
             title="Alice",
             directory="people",
-            entity_type="person",
+            note_type="person",
             content=dedent("""\
                 ## Observations
                 - [name] Alice Smith
@@ -42,7 +44,7 @@ async def create_person_entities(entity_service, search_service):
         EntitySchema(
             title="Bob",
             directory="people",
-            entity_type="person",
+            note_type="person",
             content=dedent("""\
                 ## Observations
                 - [name] Bob Jones
@@ -56,7 +58,7 @@ async def create_person_entities(entity_service, search_service):
         EntitySchema(
             title="Carol",
             directory="people",
-            entity_type="person",
+            note_type="person",
             content=dedent("""\
                 ## Observations
                 - [name] Carol Lee
@@ -93,13 +95,13 @@ async def test_infer_schema(
 
     response = await client.post(
         f"{v2_project_url}/schema/infer",
-        params={"entity_type": "person"},
+        params={"note_type": "person"},
     )
 
     assert response.status_code == 200
     data = response.json()
 
-    assert data["entity_type"] == "person"
+    assert data["note_type"] == "person"
     assert data["notes_analyzed"] == 3
     assert isinstance(data["field_frequencies"], list)
     assert isinstance(data["suggested_schema"], dict)
@@ -125,7 +127,7 @@ async def test_infer_schema_no_matching_notes(
     """Infer returns empty result when no notes of the given type exist."""
     response = await client.post(
         f"{v2_project_url}/schema/infer",
-        params={"entity_type": "nonexistent"},
+        params={"note_type": "nonexistent"},
     )
 
     assert response.status_code == 200
@@ -150,7 +152,7 @@ async def test_infer_schema_includes_relations(
 
     response = await client.post(
         f"{v2_project_url}/schema/infer",
-        params={"entity_type": "person"},
+        params={"note_type": "person"},
     )
 
     assert response.status_code == 200
@@ -184,7 +186,7 @@ async def test_validate_with_inline_schema(
         EntitySchema(
             title="Dave",
             directory="people",
-            entity_type="person",
+            note_type="person",
             entity_metadata={
                 "schema": {"name": "string", "role": "string"},
             },
@@ -199,7 +201,7 @@ async def test_validate_with_inline_schema(
 
     response = await client.post(
         f"{v2_project_url}/schema/validate",
-        params={"entity_type": "person"},
+        params={"note_type": "person"},
     )
 
     assert response.status_code == 200
@@ -221,6 +223,64 @@ async def test_validate_with_inline_schema(
 
 
 @pytest.mark.asyncio
+async def test_validate_with_explicit_schema_reference_by_permalink_slug(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Validate resolves explicit schema refs by exact schema identifier (non-fuzzy)."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Strict Person V2",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "person",
+                "schema": {"name": "string", "role": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Strict schema for person notes
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Frank",
+            directory="people",
+            note_type="person",
+            entity_metadata={
+                # Explicit schema identifier does not equal entity metadata field ("person")
+                # and must resolve by schema identifier, not fuzzy text search.
+                "schema": "strict-person-v2",
+            },
+            content=dedent("""\
+                ## Observations
+                - [name] Frank Nguyen
+                - [role] Engineer
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"identifier": note_entity.permalink},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_notes"] == 1
+    assert len(data["results"]) == 1
+    assert data["results"][0]["schema_entity"] == "person"
+    assert data["results"][0]["passed"] is True
+
+
+@pytest.mark.asyncio
 async def test_validate_missing_required_field(
     client: AsyncClient,
     test_project: Project,
@@ -234,7 +294,7 @@ async def test_validate_missing_required_field(
         EntitySchema(
             title="Eve",
             directory="people",
-            entity_type="person",
+            note_type="person",
             entity_metadata={
                 "schema": {"name": "string", "role": "string"},
             },
@@ -248,7 +308,7 @@ async def test_validate_missing_required_field(
 
     response = await client.post(
         f"{v2_project_url}/schema/validate",
-        params={"entity_type": "person"},
+        params={"note_type": "person"},
     )
 
     assert response.status_code == 200
@@ -271,13 +331,234 @@ async def test_validate_no_matching_notes(
     """Validate returns empty result when no notes of the given type exist."""
     response = await client.post(
         f"{v2_project_url}/schema/validate",
-        params={"entity_type": "nonexistent"},
+        params={"note_type": "nonexistent"},
     )
 
     assert response.status_code == 200
     data = response.json()
     assert data["total_notes"] == 0
+    assert data["total_entities"] == 0
     assert data["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_total_entities_without_schema(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Validate reports total_entities even when no schema exists (total_notes == 0)."""
+    await create_person_entities(entity_service, search_service)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"note_type": "person"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    # No schema -> no notes validated
+    assert data["total_notes"] == 0
+    # But entities of this type do exist
+    assert data["total_entities"] == 3
+    assert data["results"] == []
+
+
+# --- Frontmatter Validation Tests ---
+
+
+@pytest.mark.asyncio
+async def test_validate_with_frontmatter_rules_passes(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Validate a note whose frontmatter matches settings.frontmatter rules."""
+    # Schema note with frontmatter validation rules
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Person Schema FM",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "person_fm",
+                "schema": {"name": "string"},
+                "settings": {
+                    "validation": "warn",
+                    "frontmatter": {
+                        "tags?(array)": "string",
+                        "status?(enum)": ["draft", "published"],
+                    },
+                },
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema with frontmatter rules
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Note with matching frontmatter
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Grace",
+            directory="people",
+            note_type="person_fm",
+            entity_metadata={
+                "tags": ["engineer", "python"],
+                "status": "published",
+            },
+            content=dedent("""\
+                ## Observations
+                - [name] Grace Hopper
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"identifier": note_entity.permalink},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_notes"] == 1
+    result = data["results"][0]
+    assert result["passed"] is True
+    assert result["warnings"] == []
+    # Should have field results for "name" (observation) + "tags" + "status" (frontmatter)
+    field_names = [fr["field_name"] for fr in result["field_results"]]
+    assert "tags" in field_names
+    assert "status" in field_names
+
+
+@pytest.mark.asyncio
+async def test_validate_frontmatter_missing_required_key_warns(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Missing required frontmatter key produces a warning."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Person Schema FM2",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "person_fm2",
+                "schema": {"name": "string"},
+                "settings": {
+                    "validation": "warn",
+                    "frontmatter": {
+                        "status": "string",  # required
+                    },
+                },
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema requiring status frontmatter
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Note without the required "status" frontmatter key
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Hank",
+            directory="people",
+            note_type="person_fm2",
+            content=dedent("""\
+                ## Observations
+                - [name] Hank Pym
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"identifier": note_entity.permalink},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    result = data["results"][0]
+    assert result["passed"] is True
+    assert any("status" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_validate_frontmatter_enum_mismatch_warns(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+):
+    """Frontmatter enum mismatch produces a warning."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Person Schema FM3",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "person_fm3",
+                "schema": {"name": "string"},
+                "settings": {
+                    "validation": "warn",
+                    "frontmatter": {
+                        "status?(enum)": ["draft", "published"],
+                    },
+                },
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema with enum frontmatter
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Note with invalid enum value in frontmatter
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Iris",
+            directory="people",
+            note_type="person_fm3",
+            entity_metadata={
+                "status": "archived",  # not in [draft, published]
+            },
+            content=dedent("""\
+                ## Observations
+                - [name] Iris West
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"identifier": note_entity.permalink},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    result = data["results"][0]
+    assert result["passed"] is True
+    # Should have a warning about the enum mismatch
+    assert any("status" in w for w in result["warnings"])
+    # The field result should show enum_mismatch
+    status_fr = next(fr for fr in result["field_results"] if fr["field_name"] == "status")
+    assert status_fr["status"] == "enum_mismatch"
 
 
 # --- Diff Endpoint Tests ---
@@ -296,7 +577,7 @@ async def test_diff_no_schema_found(
 
     assert response.status_code == 200
     data = response.json()
-    assert data["entity_type"] == "nonexistent"
+    assert data["note_type"] == "nonexistent"
     assert data["new_fields"] == []
     assert data["dropped_fields"] == []
     assert data["cardinality_changes"] == []
@@ -318,7 +599,7 @@ async def test_diff_with_schema_note(
         EntitySchema(
             title="Person Schema",
             directory="schemas",
-            entity_type="schema",
+            note_type="schema",
             entity_metadata={
                 "entity": "person",
                 "version": 1,
@@ -341,7 +622,280 @@ async def test_diff_with_schema_note(
 
     assert response.status_code == 200
     data = response.json()
-    assert data["entity_type"] == "person"
+    assert data["note_type"] == "person"
     assert isinstance(data["new_fields"], list)
     assert isinstance(data["dropped_fields"], list)
     assert isinstance(data["cardinality_changes"], list)
+
+
+# --- File-based schema frontmatter tests ---
+
+
+@pytest.mark.asyncio
+async def test_validate_reads_schema_from_file_not_database(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+    file_service: FileService,
+):
+    """Validate uses schema frontmatter from the file, not stale database metadata.
+
+    Simulates the core bug from #634: user edits a schema file to change
+    validation mode from 'warn' to 'strict', but the file watcher hasn't
+    synced. The database still has 'warn', but validation should use 'strict'
+    from the file.
+    """
+    # Create schema entity — DB gets validation=warn
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Editable Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "editable_type",
+                "schema": {"name": "string", "role": "string"},
+                "settings": {"validation": "warn"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema that will be edited on disk
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Overwrite the file on disk with validation=strict
+    file_path = Path(file_service.base_path) / schema_entity.file_path
+    file_path.write_text(
+        dedent("""\
+        ---
+        title: Editable Schema
+        permalink: schemas/editable-schema
+        type: schema
+        entity: editable_type
+        schema:
+          name: string
+          role: string
+        settings:
+          validation: strict
+        ---
+
+        # Editable Schema
+
+        ## Observations
+        - [note] Schema that will be edited on disk
+    """)
+    )
+
+    # Create a note missing "role" — strict mode should produce errors, not warnings
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="TestNote",
+            directory="notes",
+            note_type="editable_type",
+            content=dedent("""\
+                ## Observations
+                - [name] Test Person
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"identifier": note_entity.permalink},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_notes"] == 1
+    result = data["results"][0]
+    # strict mode: missing required field is an error, not a warning
+    assert result["passed"] is False
+    assert any("role" in e for e in result["errors"])
+
+
+@pytest.mark.asyncio
+async def test_validate_falls_back_to_db_on_incomplete_frontmatter(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+    file_service: FileService,
+):
+    """Validate falls back to database metadata when file has incomplete frontmatter.
+
+    Simulates a mid-edit state where the user has removed the 'schema' key
+    from the file. The validator should use the last-known-good metadata
+    from the database rather than failing with a 500.
+    """
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Incomplete Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "incomplete_type",
+                "schema": {"name": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema that will have incomplete frontmatter
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Overwrite file with frontmatter missing the 'schema' key
+    file_path = Path(file_service.base_path) / schema_entity.file_path
+    file_path.write_text(
+        dedent("""\
+        ---
+        title: Incomplete Schema
+        permalink: schemas/incomplete-schema
+        type: schema
+        entity: incomplete_type
+        ---
+
+        # Incomplete Schema
+
+        ## Observations
+        - [note] Mid-edit state
+    """)
+    )
+
+    # Create a note to validate against this schema
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="FallbackNote",
+            directory="notes",
+            note_type="incomplete_type",
+            content=dedent("""\
+                ## Observations
+                - [name] Test Fallback
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"note_type": "incomplete_type"},
+    )
+
+    # Should not 500 — falls back to DB metadata and validates successfully
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_notes"] == 1
+    result = data["results"][0]
+    assert result["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_validate_falls_back_to_db_on_missing_file(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+    file_service: FileService,
+):
+    """Validate falls back to database metadata when schema file is missing.
+
+    Simulates a race condition where the file has been deleted but the
+    database still has the entity. The validator should use DB metadata
+    rather than failing entirely.
+    """
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Missing File Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "missing_file_type",
+                "schema": {"name": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema whose file will be deleted
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Delete the schema file from disk
+    file_path = Path(file_service.base_path) / schema_entity.file_path
+    file_path.unlink()
+
+    # Create a note to validate
+    note_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="OrphanNote",
+            directory="notes",
+            note_type="missing_file_type",
+            content=dedent("""\
+                ## Observations
+                - [name] Test Orphan
+            """),
+        )
+    )
+    await search_service.index_entity(note_entity)
+
+    response = await client.post(
+        f"{v2_project_url}/schema/validate",
+        params={"note_type": "missing_file_type"},
+    )
+
+    # Should not 500 — falls back to DB metadata and validates
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_notes"] == 1
+    result = data["results"][0]
+    assert result["passed"] is True
+
+
+@pytest.mark.asyncio
+async def test_diff_falls_back_to_db_on_missing_file(
+    client: AsyncClient,
+    test_project: Project,
+    v2_project_url: str,
+    entity_service,
+    search_service,
+    file_service: FileService,
+):
+    """Diff endpoint falls back to DB metadata when schema file is missing."""
+    schema_entity, _ = await entity_service.create_or_update_entity(
+        EntitySchema(
+            title="Diff Missing Schema",
+            directory="schemas",
+            note_type="schema",
+            entity_metadata={
+                "entity": "diff_missing_type",
+                "schema": {"name": "string", "role": "string"},
+            },
+            content=dedent("""\
+                ## Observations
+                - [note] Schema for diff fallback test
+            """),
+        )
+    )
+    await search_service.index_entity(schema_entity)
+
+    # Delete the schema file
+    file_path = Path(file_service.base_path) / schema_entity.file_path
+    file_path.unlink()
+
+    # Create person entities
+    await create_person_entities(entity_service, search_service)
+
+    response = await client.get(
+        f"{v2_project_url}/schema/diff/diff_missing_type",
+    )
+
+    # Should not 500 — falls back to DB metadata for schema resolution
+    assert response.status_code == 200
+    data = response.json()
+    assert data["note_type"] == "diff_missing_type"

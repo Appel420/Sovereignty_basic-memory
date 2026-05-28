@@ -140,10 +140,12 @@ def validate_timeframe(timeframe: str) -> str:
     if parsed > now:
         raise ValueError("Timeframe cannot be in the future")  # pragma: no cover
 
-    # Could format the duration back to our standard format
-    days = (now - parsed).days
+    # Round to nearest day to handle DST transitions where an hour shift
+    # can cause e.g. "7d" to compute as 6 days + 23 hours
+    total_seconds = (now - parsed).total_seconds()
+    days = round(total_seconds / 86400)
 
-    # Could enforce reasonable limits
+    # Enforce reasonable limits
     if days > 365:
         raise ValueError("Timeframe should be <= 1 year")
 
@@ -156,8 +158,8 @@ Permalink = Annotated[str, MinLen(1)]
 """Unique identifier in format '{path}/{normalized_name}'."""
 
 
-EntityType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
-"""Classification of entity (e.g., 'person', 'project', 'concept'). """
+NoteType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
+"""Classification of note (e.g., 'note', 'person', 'spec', 'schema'). """
 
 ALLOWED_CONTENT_TYPES = {
     "text/markdown",
@@ -176,8 +178,13 @@ ContentType = Annotated[
 ]
 
 
-RelationType = Annotated[str, MinLen(1), MaxLen(200)]
-"""Type of relationship between entities. Always use active voice present tense."""
+RelationType = Annotated[str, MinLen(1)]
+"""Type of relationship between entities. Always use active voice present tense.
+
+The database stores relation_type as an unrestricted string, and response models
+need to tolerate existing long-form values written by LLMs. Keeping an API-only
+200-character cap here causes reads to fail for valid stored data.
+"""
 
 ObservationStr = Annotated[
     str,
@@ -228,7 +235,7 @@ class Entity(BaseModel):
     title: str
     content: Optional[str] = None
     directory: str
-    entity_type: EntityType = "note"
+    note_type: NoteType = "note"
     entity_metadata: Optional[Dict] = Field(default=None, description="Optional metadata")
     content_type: ContentType = Field(
         description="MIME type of the content (e.g. text/markdown, image/jpeg)",

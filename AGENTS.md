@@ -22,15 +22,16 @@ See the [README.md](README.md) file for a project overview.
 - Run unit tests (Postgres): `just test-unit-postgres`
 - Run integration tests (SQLite): `just test-int-sqlite`
 - Run integration tests (Postgres): `just test-int-postgres`
-- Run impacted tests: `just testmon` (pytest-testmon)
+- Run impacted tests: `just testmon` (pytest-testmon; only tests affected by changed code)
 - Run MCP smoke test: `just test-smoke`
-- Fast local loop: `just fast-check`
+- Fast local loop: `just fast-check` (default iteration flow)
 - Local consistency check: `just doctor`
 - Generate HTML coverage: `just coverage`
 - Single test: `pytest tests/path/to/test_file.py::test_function_name`
 - Run benchmarks: `pytest test-int/test_sync_performance_benchmark.py -v -m "benchmark and not slow"`
 - Lint: `just lint` or `ruff check . --fix`
-- Type check: `just typecheck` or `uv run pyright`
+- Type check: `just typecheck` or `uv run ty check src tests test-int`
+- Type check (pyright): `just typecheck-pyright` or `uv run pyright`
 - Format: `just format` or `uv run ruff format .`
 - Run all code checks: `just check` (runs lint, format, typecheck, test)
 - Create db migration: `just migration "Your migration message"`
@@ -47,11 +48,22 @@ See the [README.md](README.md) file for a project overview.
 ### Code/Test/Verify Loop (fast path)
 
 1) **Code:** make changes.
-2) **Test:** `just fast-check` (lint/format/typecheck + impacted tests + MCP smoke).
+2) **Test:** `just fast-check` (lint/format/typecheck + pytest-testmon impacted tests for changed code).
 3) **Verify:** `just doctor` (end-to-end file ↔ DB loop in a temp project).
 4) **Full gate (when needed):** `just test` or `just check` for SQLite + Postgres.
 
+Run `just test-smoke` when you specifically need the MCP smoke flow.
+
 If testmon is “cold,” the first run may be long. Subsequent runs get much faster.
+
+### PR CI Gate
+
+Before opening or updating a PR, run the checks that mirror the common required CI failures:
+
+- Run `just typecheck` in addition to targeted `ruff` and `pytest` commands when tests were added or changed.
+- Sign commits with `git commit -s` so DCO passes. If a PR branch already has unsigned commits, rewrite the branch with signed-off commits before asking for review.
+- Use a semantic PR title accepted by `.github/workflows/pr-title.yml`: `type(scope): summary`.
+- Use one of the allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`.
 
 ### Test Structure
 
@@ -240,6 +252,31 @@ async_client.set_client_factory(your_custom_factory)
 ```
 
 See SPEC-16 for full context manager refactor details.
+
+### Release Process
+
+Releases are driven by `just release` / `just beta` — never by a bare `git tag`. The recipes bump version metadata, run pre-flight checks, commit, tag, and push. GitHub Actions then publishes to PyPI and updates the Homebrew formula.
+
+**Stable release:**
+
+```
+just release v0.21.3
+```
+
+The recipe runs `just lint` + `just typecheck`, then updates `__version__` in `src/basic_memory/__init__.py` and `"version"` in `server.json` (MCP registry metadata), commits as `chore: update version to X.Y.Z for vX.Y.Z release`, creates the `vX.Y.Z` tag, and pushes both the commit and the tag to `origin/main`. After the tag lands, the `Release` workflow builds the package, publishes to PyPI, creates the GitHub release with auto-generated notes, and updates the Homebrew formula. The recipe finishes by printing the post-release tasks the workflow doesn't cover.
+
+**Beta release:** `just beta v0.21.3b1` — same flow with a beta-suffixed tag. PyPI consumers install with `pip install basic-memory --pre`.
+
+**Development builds:** every commit to `main` publishes a `0.21.3.dev26+468a22f`-style version to PyPI automatically via `.github/workflows/dev-release.yml`. No human action.
+
+**Do not tag releases by hand.** A bare `git tag vX.Y.Z` skips the in-code version bump. Package metadata is still correct (uv-dynamic-versioning derives it from the git tag) but `basic-memory --version` reports the previous release, which is what happened with v0.21.2 → v0.21.3.
+
+**Post-release tasks** the recipe surfaces but doesn't run:
+- `docs.basicmemory.com` — add notes to `src/pages/latest-releases.mdx`
+- `basicmachines.co` — bump version in `src/components/sections/hero.tsx`
+- MCP Registry — `mcp-publisher publish` from the repo root
+
+See `.claude/commands/release/release.md` (and `beta.md`, `release-check.md`, `changelog.md` alongside it) for the full release + post-release runbook, including the slash commands.
 
 ## BASIC MEMORY PRODUCT USAGE
 
@@ -441,5 +478,9 @@ With GitHub integration, the development workflow includes:
 3. **Branch management** - Claude can create feature branches for implementations
 4. **Documentation maintenance** - Claude can keep documentation updated as the code evolves
 5. **Code Commits**: ALWAYS sign off commits with `git commit -s`
+6. **Pull Request Titles**: PR titles must follow the semantic format enforced by `.github/workflows/pr-title.yml`: `type(scope): summary`
+   - Allowed types: `feat`, `fix`, `chore`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
+   - Allowed scopes: `core`, `cli`, `api`, `mcp`, `sync`, `ui`, `deps`, `installer`
+   - Example: `fix(cli): propagate cloud workspace routing`
 
 This level of integration represents a new paradigm in AI-human collaboration, where the AI assistant becomes a full-fledged team member rather than just a tool for generating code snippets.

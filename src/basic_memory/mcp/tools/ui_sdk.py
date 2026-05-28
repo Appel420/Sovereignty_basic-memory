@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastmcp import Context
 from mcp.types import ContentBlock, TextContent
@@ -20,15 +20,26 @@ def _text_block(message: str) -> List[ContentBlock]:
 @mcp.tool(
     description="Search notes and return an embedded MCP-UI resource (raw HTML).",
     output_schema=None,
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def search_notes_ui(
     query: str,
     project: Optional[str] = None,
+    project_id: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
-    search_type: str = "text",
-    types: List[str] | None = None,
-    entity_types: List[str] | None = None,
+    search_type: Optional[str] = None,
+    note_types: Annotated[
+        List[str] | None,
+        "Filter by the 'type' field in note frontmatter (e.g. 'note', 'chapter', 'person'). "
+        "Case-insensitive.",
+    ] = None,
+    entity_types: Annotated[
+        List[str] | None,
+        "Filter by knowledge graph item type: 'entity' (whole notes), 'observation', or "
+        "'relation'. Defaults to 'entity'. Do NOT pass schema/frontmatter types like "
+        "'Chapter' here — use note_types instead.",
+    ] = None,
     after_date: Optional[str] = None,
     metadata_filters: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
@@ -36,14 +47,15 @@ async def search_notes_ui(
     context: Context | None = None,
 ) -> List[ContentBlock]:
     """Return a search results UI as an embedded MCP-UI resource."""
-    result = await search_notes.fn(
+    result = await search_notes(
         query=query,
         project=project,
+        project_id=project_id,
         page=page,
         page_size=page_size,
         search_type=search_type,
-        output_format="default",
-        types=types,
+        output_format="json",
+        note_types=note_types,
         entity_types=entity_types,
         after_date=after_date,
         metadata_filters=metadata_filters,
@@ -62,7 +74,7 @@ async def search_notes_ui(
             "page": page,
             "page_size": page_size,
         },
-        "toolOutput": result.model_dump(),
+        "toolOutput": result,
     }
 
     try:
@@ -82,29 +94,26 @@ async def search_notes_ui(
 @mcp.tool(
     description="Read a note and return an embedded MCP-UI resource (raw HTML).",
     output_schema=None,
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def read_note_ui(
     identifier: str,
     project: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 10,
+    project_id: Optional[str] = None,
     context: Context | None = None,
 ) -> List[ContentBlock]:
     """Return a note preview UI as an embedded MCP-UI resource."""
-    content = await read_note.fn(
+    content = await read_note(
         identifier=identifier,
         project=project,
-        page=page,
-        page_size=page_size,
-        output_format="default",
+        project_id=project_id,
+        output_format="text",
         context=context,
     )
 
     render_data = {
         "toolInput": {
             "identifier": identifier,
-            "page": page,
-            "page_size": page_size,
         },
         "toolOutput": content,
     }

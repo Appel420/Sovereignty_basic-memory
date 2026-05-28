@@ -1,26 +1,26 @@
 # Semantic Search
 
-This guide covers Basic Memory's optional semantic (vector) search feature, which adds meaning-based retrieval alongside the existing full-text search.
+This guide covers Basic Memory's semantic (vector) search feature, which adds meaning-based retrieval alongside the existing full-text search.
 
 ## Overview
 
-Basic Memory's default search uses full-text search (FTS) — keyword matching with boolean operators. Semantic search adds vector embeddings that capture the *meaning* of your content, enabling:
+Basic Memory's search supports both full-text search (FTS) and semantic retrieval. Semantic search adds vector embeddings that capture the *meaning* of your content, enabling:
 
 - **Paraphrase matching**: Find "authentication flow" when searching for "login process"
 - **Conceptual queries**: Search for "ways to improve performance" and find notes about caching, indexing, and optimization
 - **Hybrid retrieval**: Combine the precision of keyword search with the recall of semantic similarity
 
-Semantic search is **opt-in** — existing behavior is completely unchanged unless you enable it. It works on both SQLite (local) and Postgres (cloud) backends.
+Semantic search is enabled by default when semantic dependencies are available at runtime. It works on both SQLite (local) and Postgres (cloud) backends.
 
 ## Installation
 
-Semantic search dependencies (fastembed, sqlite-vec, openai) are **optional extras** — they are not installed with the base `basic-memory` package. Install them with:
+Semantic search dependencies (fastembed, sqlite-vec, openai) are included in the default `basic-memory` install.
 
 ```bash
-pip install 'basic-memory[semantic]'
+pip install basic-memory
 ```
 
-This keeps the base install lightweight and avoids platform-specific issues with ONNX Runtime wheels.
+You can always override with `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true|false`.
 
 ### Platform Compatibility
 
@@ -34,36 +34,40 @@ This keeps the base install lightweight and avoids platform-specific issues with
 
 #### Intel Mac Workaround
 
-The default FastEmbed provider uses ONNX Runtime, which dropped Intel Mac (x86_64) wheels starting in v1.24. Intel Mac users have two options:
+The default install includes FastEmbed, which depends on ONNX Runtime. ONNX Runtime dropped Intel Mac (x86_64) wheels starting in v1.24, so install with a compatible ONNX Runtime pin first:
+
+```bash
+pip install basic-memory 'onnxruntime<1.24'
+```
+
+After installation, Intel Mac users have two runtime options:
 
 **Option 1: Use OpenAI embeddings (recommended)**
 
-Install only the OpenAI dependency manually — no ONNX Runtime or FastEmbed needed:
-
 ```bash
-pip install openai sqlite-vec
 export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
 export BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER=openai
 export OPENAI_API_KEY=sk-...
 ```
 
-**Option 2: Pin an older ONNX Runtime**
+**Option 2: Use FastEmbed locally**
 
-FastEmbed's ONNX Runtime dependency is unpinned, so you can constrain it to an older version that still ships Intel Mac wheels by passing both requirements in the same install command:
+Keep the same pinned installation and use FastEmbed (default provider):
 
 ```bash
-pip install 'basic-memory[semantic]' 'onnxruntime<1.24'
+export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
+export BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER=fastembed
 ```
 
 ## Quick Start
 
-1. Install semantic extras:
+1. Install Basic Memory:
 
 ```bash
-pip install 'basic-memory[semantic]'
+pip install basic-memory
 ```
 
-2. Enable semantic search:
+2. (Optional) Explicitly enable semantic search:
 
 ```bash
 export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
@@ -84,7 +88,7 @@ search_notes("login process", search_type="vector")
 # Hybrid: combines FTS precision with vector recall (recommended)
 search_notes("login process", search_type="hybrid")
 
-# Traditional full-text search (still the default)
+# Explicit full-text search
 search_notes("login process", search_type="text")
 ```
 
@@ -94,7 +98,7 @@ All settings are fields on `BasicMemoryConfig` and can be set via environment va
 
 | Config Field | Env Var | Default | Description |
 |---|---|---|---|
-| `semantic_search_enabled` | `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED` | `false` | Enable semantic search. Required before vector/hybrid modes work. |
+| `semantic_search_enabled` | `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED` | Auto (`true` when semantic deps are available) | Enable semantic search. Required before vector/hybrid modes work. |
 | `semantic_embedding_provider` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_PROVIDER` | `"fastembed"` | Embedding provider: `"fastembed"` (local) or `"openai"` (API). |
 | `semantic_embedding_model` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_MODEL` | `"bge-small-en-v1.5"` | Model identifier. Auto-adjusted per provider if left at default. |
 | `semantic_embedding_dimensions` | `BASIC_MEMORY_SEMANTIC_EMBEDDING_DIMENSIONS` | Auto-detected | Vector dimensions. 384 for FastEmbed, 1536 for OpenAI. Override only if using a non-default model. |
@@ -112,8 +116,8 @@ FastEmbed runs entirely locally using ONNX models — no API key, no network cal
 - **Tradeoff**: Smaller model, fast inference, good quality for most use cases
 
 ```bash
-# Install semantic extras and enable
-pip install 'basic-memory[semantic]'
+# Install basic-memory and enable semantic search
+pip install basic-memory
 export BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true
 ```
 
@@ -161,13 +165,13 @@ Returns results ranked by cosine similarity. Individual observations and relatio
 
 ### `hybrid`
 
-Combines FTS and vector results using reciprocal rank fusion (RRF). This is generally the best mode when you want both keyword precision and semantic recall.
+Combines FTS and vector results using score-based fusion. This is generally the best mode when you want both keyword precision and semantic recall.
 
 ```python
 search_notes("authentication security", search_type="hybrid")
 ```
 
-RRF merges the two ranked lists so that items appearing in both get a score boost, while items found by only one method still appear.
+Score-based fusion uses the formula `max(vec, fts) + bonus * min(vec, fts)` to preserve the dominant signal while rewarding results found by both methods.
 
 ### When to Use Which
 
@@ -197,7 +201,8 @@ bm reindex -p my-project
 
 ### When You Need to Reindex
 
-- **First enable**: After turning on `semantic_search_enabled` for the first time
+- **Upgrade note**: Migration now performs a one-time automatic embedding backfill on upgrade.
+- **Manual enable case**: If you explicitly had `semantic_search_enabled=false` and then turn it on
 - **Provider change**: After switching between `fastembed` and `openai`
 - **Model change**: After changing `semantic_embedding_model`
 - **Dimension change**: After changing `semantic_embedding_dimensions`
@@ -231,14 +236,14 @@ Each chunk has a `source_hash` (SHA-256 of the chunk text). On re-sync, unchange
 
 ### Hybrid Fusion
 
-Hybrid search uses reciprocal rank fusion (RRF) to merge FTS and vector results:
+Hybrid search uses score-based fusion to merge FTS and vector results:
 
-1. Run FTS search to get keyword-ranked results
-2. Run vector search to get similarity-ranked results
-3. For each result, compute: `score = 1/(k + fts_rank) + 1/(k + vector_rank)` where `k = 60`
+1. Run FTS search to get keyword-ranked results; normalize scores to [0, 1]
+2. Run vector search to get similarity-ranked results (already [0, 1])
+3. For each result, compute: `fused = max(vec_score, fts_score) + 0.3 * min(vec_score, fts_score)`
 4. Sort by fused score
 
-Items found by both methods get a natural score boost. Items found by only one method still appear but rank lower.
+The dominant signal (whichever source scored higher) is preserved, and dual-source agreement adds a bonus. Unlike rank-based fusion, this approach retains score magnitude — a strong vector match stays strong even without an FTS hit.
 
 ### Observation-Level Results
 
@@ -258,6 +263,7 @@ The sqlite-vec extension is loaded per-connection. Vector tables are created laz
 ### Postgres (cloud)
 
 - **Vector storage**: [pgvector](https://github.com/pgvector/pgvector) with HNSW indexing
+- **Local Docker**: use `docker-compose-postgres.yml` (`pgvector/pgvector:pg17`). Plain `postgres:17` lacks the extension; run `CREATE EXTENSION IF NOT EXISTS vector;` on any external instance before first migration.
 - **Chunk metadata table**: Created via Alembic migration (`search_vector_chunks` with `BIGSERIAL` primary key)
 - **Embedding table**: `search_vector_embeddings` created at runtime (dimension-dependent, same pattern as SQLite)
 - **Index**: HNSW index on the embedding column for fast approximate nearest-neighbour queries

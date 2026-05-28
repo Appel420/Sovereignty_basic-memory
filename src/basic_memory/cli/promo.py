@@ -2,14 +2,18 @@
 
 import os
 import sys
-from collections.abc import Callable
 
-import typer
+from rich.console import Console
+from rich.panel import Panel
 
+import basic_memory
+from basic_memory.cli.analytics import track, EVENT_PROMO_SHOWN
 from basic_memory.config import ConfigManager
 
-CLOUD_PROMO_VERSION = "2026-02-06"
-OSS_DISCOUNT_CODE = "{{OSS_DISCOUNT_CODE}}"
+OSS_DISCOUNT_CODE = "BMFOSS"
+CLOUD_LEARN_MORE_URL = (
+    "https://basicmemory.com?utm_source=bm-foss&utm_medium=promo&utm_campaign=cloud-upsell"
+)
 
 
 def _promos_disabled_by_env() -> bool:
@@ -20,27 +24,53 @@ def _promos_disabled_by_env() -> bool:
 
 def _is_interactive_session() -> bool:
     """Return whether stdin/stdout are interactive terminals."""
-    return sys.stdin.isatty() and sys.stdout.isatty()
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except ValueError:
+        # Trigger: stdin/stdout already closed (e.g., MCP stdio transport shutdown)
+        # Why: isatty() raises ValueError on closed file descriptors
+        # Outcome: treat as non-interactive, suppressing promo output
+        return False
 
 
-def _build_first_run_message() -> str:
-    """Build first-run cloud promo copy."""
+def _build_cloud_promo_message() -> str:
+    """Build benefit-led cloud upsell copy with Rich markup."""
     return (
-        "Basic Memory initialized (local mode).\n"
-        "Cloud is optional and keeps your workflow local-first.\n"
-        "Cloud adds cross-device sync + mobile/web access.\n"
-        f"OSS discount: {OSS_DISCOUNT_CODE} (20% off for 3 months).\n"
-        "Run `bm cloud login` to enable."
+        "☁️ [bold]Your knowledge, everywhere.[/bold] ✨\n"
+        "Stop losing context when you switch machines.\n"
+        "Basic Memory Cloud syncs your memory across every device, including mobile and web.\n"
+        "Try it free for 7 days.\n"
+        f"Use [bold cyan]{OSS_DISCOUNT_CODE}[/bold cyan] for 20% off when you subscribe.\n"
+        "[bold green]→ bm cloud login[/bold green]"
     )
 
 
-def _build_version_message() -> str:
-    """Build cloud promo copy shown after promo-version bumps."""
-    return (
-        "New in Basic Memory Cloud: cross-device sync + mobile/web access.\n"
-        f"OSS discount: {OSS_DISCOUNT_CODE} (20% off for 3 months).\n"
-        "Run `bm cloud login` to enable."
-    )
+def maybe_show_init_line(
+    invoked_subcommand: str | None,
+    *,
+    config_manager: ConfigManager | None = None,
+    is_interactive: bool | None = None,
+    console: Console | None = None,
+) -> None:
+    """Show a one-time init confirmation line before command output."""
+    manager = config_manager or ConfigManager()
+    config = manager.load_config()
+
+    interactive = _is_interactive_session() if is_interactive is None else is_interactive
+
+    # Same gates as the cloud promo — suppress in non-interactive, env kill-switch,
+    # mcp/root-help contexts, or when already shown.
+    if _promos_disabled_by_env() or not interactive:
+        return
+
+    if invoked_subcommand in {None, "mcp"}:
+        return
+
+    if config.cloud_promo_first_run_shown:
+        return
+
+    out = console or Console()
+    out.print("Basic Memory initialized ✓")
 
 
 def maybe_show_cloud_promo(
@@ -48,11 +78,15 @@ def maybe_show_cloud_promo(
     *,
     config_manager: ConfigManager | None = None,
     is_interactive: bool | None = None,
-    echo: Callable[[str], None] = typer.echo,
+    console: Console | None = None,
 ) -> None:
     """Show cloud promo copy when discovery gates are satisfied."""
     manager = config_manager or ConfigManager()
     config = manager.load_config()
+    from basic_memory.cli.auth import CLIAuth
+
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    has_cloud_access = bool(config.cloud_api_key) or auth.load_tokens() is not None
 
     interactive = _is_interactive_session() if is_interactive is None else is_interactive
 
@@ -68,17 +102,29 @@ def maybe_show_cloud_promo(
     if invoked_subcommand in {None, "mcp"}:
         return
 
-    if config.cloud_mode_enabled or config.cloud_promo_opt_out:
+    if has_cloud_access or config.cloud_promo_opt_out:
         return
 
     show_first_run = not config.cloud_promo_first_run_shown
-    show_version_notice = config.cloud_promo_last_version_shown != CLOUD_PROMO_VERSION
+    show_version_notice = config.cloud_promo_last_version_shown != basic_memory.__version__
     if not show_first_run and not show_version_notice:
         return
 
-    message = _build_first_run_message() if show_first_run else _build_version_message()
-    echo(message)
+    out = console or Console()
+    out.print(
+        Panel(
+            _build_cloud_promo_message(),
+            title="Basic Memory Cloud",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+    out.print(f"Learn more at [link={CLOUD_LEARN_MORE_URL}]{CLOUD_LEARN_MORE_URL}[/link]")
+    out.print("[dim]Disable with: bm cloud promo --off[/dim]")
+
+    trigger = "first_run" if show_first_run else "version_bump"
+    track(EVENT_PROMO_SHOWN, {"trigger": trigger})
 
     config.cloud_promo_first_run_shown = True
-    config.cloud_promo_last_version_shown = CLOUD_PROMO_VERSION
+    config.cloud_promo_last_version_shown = basic_memory.__version__
     manager.save_config(config)

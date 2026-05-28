@@ -18,6 +18,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         model_name: str = "text-embedding-3-small",
         *,
         batch_size: int = 64,
+        request_concurrency: int = 4,
         dimensions: int = 1536,
         api_key: str | None = None,
         base_url: str | None = None,
@@ -26,11 +27,19 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self.model_name = model_name
         self.dimensions = dimensions
         self.batch_size = batch_size
+        self.request_concurrency = request_concurrency
         self._api_key = api_key
         self._base_url = base_url
         self._timeout = timeout
         self._client: Any | None = None
         self._client_lock = asyncio.Lock()
+
+    def runtime_log_attrs(self) -> dict[str, int]:
+        """Return the request fan-out knobs that shape API embedding batches."""
+        return {
+            "provider_batch_size": self.batch_size,
+            "request_concurrency": self.request_concurrency,
+        }
 
     async def _get_client(self) -> Any:
         if self._client is not None:
@@ -45,7 +54,8 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             except ImportError as exc:  # pragma: no cover - covered via monkeypatch tests
                 raise SemanticDependenciesMissingError(
                     "OpenAI dependency is missing. "
-                    "Install semantic extras: pip install 'basic-memory[semantic]'"
+                    "Install/update basic-memory to include semantic dependencies: "
+                    "pip install -U basic-memory"
                 ) from exc
 
             api_key = self._api_key or os.getenv("OPENAI_API_KEY")
@@ -66,25 +76,49 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             return []
 
         client = await self._get_client()
-        all_vectors: list[list[float]] = []
+        batches = [
+            texts[start : start + self.batch_size]
+            for start in range(0, len(texts), self.batch_size)
+        ]
+        batch_vectors: list[list[list[float]] | None] = [None] * len(batches)
+        semaphore = asyncio.Semaphore(self.request_concurrency)
 
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start : start + self.batch_size]
-            response = await client.embeddings.create(
-                model=self.model_name,
-                input=batch,
-            )
-            vectors_by_index: dict[int, list[float]] = {
-                int(item.index): [float(value) for value in item.embedding]
-                for item in response.data
-            }
+        async def embed_batch(batch_index: int, batch: list[str]) -> None:
+            async with semaphore:
+                response = await client.embeddings.create(
+                    model=self.model_name,
+                    input=batch,
+                )
+
+            vectors_by_index: dict[int, list[float]] = {}
+            for item in response.data:
+                response_index = int(item.index)
+                if response_index in vectors_by_index:
+                    raise RuntimeError(
+                        "OpenAI embedding response returned duplicate vector indexes."
+                    )
+                vectors_by_index[response_index] = [float(value) for value in item.embedding]
+
+            ordered_vectors: list[list[float]] = []
             for index in range(len(batch)):
                 vector = vectors_by_index.get(index)
                 if vector is None:
                     raise RuntimeError(
                         "OpenAI embedding response is missing expected vector index."
                     )
-                all_vectors.append(vector)
+                ordered_vectors.append(vector)
+
+            batch_vectors[batch_index] = ordered_vectors
+
+        await asyncio.gather(
+            *(embed_batch(batch_index, batch) for batch_index, batch in enumerate(batches))
+        )
+
+        all_vectors: list[list[float]] = []
+        for vectors in batch_vectors:
+            if vectors is None:
+                raise RuntimeError("OpenAI embedding batch did not produce vectors.")
+            all_vectors.extend(vectors)
 
         if all_vectors and len(all_vectors[0]) != self.dimensions:
             raise RuntimeError(

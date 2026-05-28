@@ -1,6 +1,8 @@
 """Tests for link resolution service."""
 
+import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,7 +31,7 @@ async def test_entities(entity_service, file_service):
     e1, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Core Service",
-            entity_type="component",
+            note_type="component",
             directory="components",
             project=entity_service.repository.project_id,
         )
@@ -37,7 +39,7 @@ async def test_entities(entity_service, file_service):
     e2, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Service Config",
-            entity_type="config",
+            note_type="config",
             directory="config",
             project=entity_service.repository.project_id,
         )
@@ -45,7 +47,7 @@ async def test_entities(entity_service, file_service):
     e3, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Auth Service",
-            entity_type="component",
+            note_type="component",
             directory="components",
             project=entity_service.repository.project_id,
         )
@@ -53,7 +55,7 @@ async def test_entities(entity_service, file_service):
     e4, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Core Features",
-            entity_type="specs",
+            note_type="specs",
             directory="specs",
             project=entity_service.repository.project_id,
         )
@@ -61,7 +63,7 @@ async def test_entities(entity_service, file_service):
     e5, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Sub Features 1",
-            entity_type="specs",
+            note_type="specs",
             directory="specs/subspec",
             project=entity_service.repository.project_id,
         )
@@ -69,7 +71,7 @@ async def test_entities(entity_service, file_service):
     e6, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Sub Features 2",
-            entity_type="specs",
+            note_type="specs",
             directory="specs/subspec",
             project=entity_service.repository.project_id,
         )
@@ -79,7 +81,7 @@ async def test_entities(entity_service, file_service):
     e7 = await entity_service.repository.add(
         EntityModel(
             title="Image.png",
-            entity_type="file",
+            note_type="file",
             content_type="image/png",
             file_path="Image.png",
             permalink="image",  # Required for Postgres NOT NULL constraint
@@ -92,7 +94,7 @@ async def test_entities(entity_service, file_service):
     e8 = await entity_service.create_entity(  # duplicate title
         EntitySchema(
             title="Core Service",
-            entity_type="component",
+            note_type="component",
             directory="components2",
             project=entity_service.repository.project_id,
         )
@@ -115,6 +117,190 @@ async def link_resolver(entity_repository, search_service, test_entities):
 def project_prefix(test_entities) -> str:
     """Project permalink prefix for expected permalinks."""
     return test_entities[0].permalink.split("/", 1)[0]
+
+
+def test_workspace_qualified_plain_identifier_shape_helper_lives_in_link_resolver():
+    """Workspace route shape detection belongs with permalink/link resolution."""
+    from basic_memory.services import link_resolver
+
+    assert link_resolver.is_workspace_qualified_plain_identifier("team-acme/research/note")
+    assert link_resolver.is_workspace_qualified_plain_identifier("team-acme/research/folder/note")
+    assert not link_resolver.is_workspace_qualified_plain_identifier(
+        "memory://team-acme/research/note"
+    )
+    assert not link_resolver.is_workspace_qualified_plain_identifier("research/note")
+
+
+@pytest.mark.asyncio
+async def test_workspace_identifier_project_detection_requires_workspace_shape(
+    monkeypatch,
+    config_manager,
+):
+    """Two-segment project-relative paths should not trigger workspace discovery."""
+    from basic_memory.services import link_resolver
+
+    def fail_if_called(identifier, config):
+        raise AssertionError("plain project-relative paths should skip cloud discovery")
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context._workspace_identifier_discovery_available",
+        fail_if_called,
+    )
+
+    detected = await link_resolver.detect_project_from_workspace_identifier_prefix(
+        "research/note",
+        config_manager.config,
+    )
+
+    assert detected is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_identifier_project_detection_skips_without_discovery(
+    monkeypatch,
+    config_manager,
+):
+    """Workspace-shaped paths stay local when cloud workspace discovery is unavailable."""
+    from basic_memory.services import link_resolver
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context._workspace_identifier_discovery_available",
+        lambda identifier, config: False,
+    )
+
+    detected = await link_resolver.detect_project_from_workspace_identifier_prefix(
+        "team-acme/research/note",
+        config_manager.config,
+    )
+
+    assert detected is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_identifier_project_detection_returns_project(
+    monkeypatch,
+    config_manager,
+):
+    """Workspace-qualified plain identifiers should return the resolved project route."""
+    from basic_memory.services import link_resolver
+
+    async def resolve_workspace_identifier(identifier, context=None):
+        assert identifier == "team-acme/research/note"
+        return SimpleNamespace(project_identifier="team-acme/research")
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context._workspace_identifier_discovery_available",
+        lambda identifier, config: True,
+    )
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context.resolve_workspace_qualified_identifier",
+        resolve_workspace_identifier,
+    )
+
+    detected = await link_resolver.detect_project_from_workspace_identifier_prefix(
+        "team-acme/research/note",
+        config_manager.config,
+    )
+
+    assert detected == "team-acme/research"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Workspace 'team-acme' was not found.",
+        "No accessible workspaces found for this account.",
+        "Unable to discover projects in any accessible workspace. Failed workspaces: team-acme",
+    ],
+)
+async def test_workspace_identifier_project_detection_ignores_discovery_failures(
+    monkeypatch,
+    config_manager,
+    message,
+):
+    """Workspace detection should fall back when cloud discovery is unavailable."""
+    from basic_memory.services import link_resolver
+
+    async def fail_workspace_identifier(identifier, context=None):
+        raise ValueError(message)
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context._workspace_identifier_discovery_available",
+        lambda identifier, config: True,
+    )
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context.resolve_workspace_qualified_identifier",
+        fail_workspace_identifier,
+    )
+
+    detected = await link_resolver.detect_project_from_workspace_identifier_prefix(
+        "team-acme/research/note",
+        config_manager.config,
+    )
+
+    assert detected is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_identifier_project_detection_allows_mixed_local_cloud_config(
+    monkeypatch,
+    config_manager,
+):
+    """Plain workspace routes should be discoverable even with local projects configured."""
+    from basic_memory.config import ProjectEntry
+    from basic_memory.mcp.project_context import (
+        WorkspaceProjectEntry,
+        _build_workspace_project_index,
+    )
+    from basic_memory.schemas.cloud import WorkspaceInfo
+    from basic_memory.schemas.project_info import ProjectItem
+    from basic_memory.services import link_resolver
+
+    config = config_manager.load_config()
+    config.projects["hermes-memory"] = ProjectEntry(
+        path=str(config_manager.config_dir.parent / "hermes-memory")
+    )
+    config.cloud_api_key = "bmc_test123"
+    config_manager.save_config(config)
+
+    workspace = WorkspaceInfo(
+        tenant_id="personal-tenant",
+        workspace_type="personal",
+        slug="personal",
+        name="Personal",
+        role="owner",
+        is_default=True,
+    )
+    project = ProjectItem(
+        id=1,
+        external_id="11111111-1111-1111-1111-111111111111",
+        name="main",
+        path="/tmp/main",
+        is_default=False,
+    )
+    index = _build_workspace_project_index(
+        (workspace,),
+        (WorkspaceProjectEntry(workspace=workspace, project=project),),
+    )
+
+    async def fake_index(context=None):
+        return index
+
+    monkeypatch.setattr(
+        "basic_memory.mcp.project_context._ensure_workspace_project_index",
+        fake_index,
+    )
+    monkeypatch.setattr("basic_memory.mcp.async_client.is_factory_mode", lambda: False)
+    monkeypatch.setattr("basic_memory.mcp.async_client._explicit_routing", lambda: False)
+    monkeypatch.setattr("basic_memory.mcp.async_client._force_local_mode", lambda: False)
+
+    detected = await link_resolver.detect_project_from_workspace_identifier_prefix(
+        "personal/main/todo",
+        config_manager.config,
+    )
+
+    assert detected == "personal/main"
 
 
 @pytest.mark.asyncio
@@ -185,7 +371,7 @@ async def test_resolve_file(link_resolver):
     # Basic new entity
     resolved = await link_resolver.resolve_link("Image.png")
     assert resolved is not None
-    assert resolved.entity_type == "file"
+    assert resolved.note_type == "file"
     assert resolved.title == "Image.png"
 
 
@@ -353,7 +539,9 @@ async def test_link_normalization_with_strict_mode(link_resolver, test_entities,
 
 
 @pytest.mark.asyncio
-async def test_duplicate_title_handling_in_strict_mode(link_resolver, test_entities, project_prefix):
+async def test_duplicate_title_handling_in_strict_mode(
+    link_resolver, test_entities, project_prefix
+):
     """Test how duplicate titles are handled in strict mode."""
 
     # "Core Service" appears twice in test data (components/core-service and components2/core-service)
@@ -389,7 +577,7 @@ async def test_cross_project_link_resolution(
     target = await other_entity_repo.add(
         EntityModel(
             title="Cross Project Note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="docs/Cross Project Note.md",
             permalink=f"{other_project.permalink}/docs/cross-project-note",
@@ -437,7 +625,7 @@ async def context_aware_entities(entity_repository):
     e1 = await entity_repository.add(
         EntityModel(
             title="testing",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="testing.md",
             permalink="testing",
@@ -452,7 +640,7 @@ async def context_aware_entities(entity_repository):
     e2 = await entity_repository.add(
         EntityModel(
             title="testing",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="main/testing/testing.md",
             permalink="main/testing/testing",
@@ -467,7 +655,7 @@ async def context_aware_entities(entity_repository):
     e3 = await entity_repository.add(
         EntityModel(
             title="another-test",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="main/testing/another-test.md",
             permalink="main/testing/another-test",
@@ -482,7 +670,7 @@ async def context_aware_entities(entity_repository):
     e4 = await entity_repository.add(
         EntityModel(
             title="testing",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="other/testing.md",
             permalink="other/testing",
@@ -497,7 +685,7 @@ async def context_aware_entities(entity_repository):
     e5 = await entity_repository.add(
         EntityModel(
             title="note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="deep/nested/folder/note.md",
             permalink="deep/nested/folder/note",
@@ -512,7 +700,7 @@ async def context_aware_entities(entity_repository):
     e6 = await entity_repository.add(
         EntityModel(
             title="note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="deep/note.md",
             permalink="deep/note",
@@ -527,7 +715,7 @@ async def context_aware_entities(entity_repository):
     e7 = await entity_repository.add(
         EntityModel(
             title="note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="note.md",
             permalink="note",
@@ -736,7 +924,7 @@ async def relative_path_entities(entity_repository):
     e1 = await entity_repository.add(
         EntityModel(
             title="link-test",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="testing/link-test.md",
             permalink="testing/link-test",
@@ -751,7 +939,7 @@ async def relative_path_entities(entity_repository):
     e2 = await entity_repository.add(
         EntityModel(
             title="deep-note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="testing/nested/deep-note.md",
             permalink="testing/nested/deep-note",
@@ -766,7 +954,7 @@ async def relative_path_entities(entity_repository):
     e3 = await entity_repository.add(
         EntityModel(
             title="deep-note",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="nested/deep-note.md",
             permalink="nested/deep-note",
@@ -781,7 +969,7 @@ async def relative_path_entities(entity_repository):
     e4 = await entity_repository.add(
         EntityModel(
             title="file",
-            entity_type="note",
+            note_type="note",
             content_type="text/markdown",
             file_path="other/file.md",
             permalink="other/file",
@@ -857,3 +1045,62 @@ async def test_simple_link_no_slash_skips_relative_resolution(relative_path_reso
     # testing/nested/ is not the same folder as testing/, but it's closer than nested/
     # The context-aware resolution will pick the closest match
     assert result.file_path == "testing/nested/deep-note.md"
+
+
+# ============================================================================
+# External ID (UUID) resolution tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_resolve_link_by_external_id(link_resolver, test_entities):
+    """Test resolving a link using a valid external_id (UUID)."""
+    entity = test_entities[0]
+    result = await link_resolver.resolve_link(entity.external_id)
+    assert result is not None
+    assert result.id == entity.id
+    assert result.external_id == entity.external_id
+
+
+@pytest.mark.asyncio
+async def test_resolve_link_by_external_id_uppercase(link_resolver, test_entities):
+    """Test that uppercase UUID is canonicalized and resolves correctly."""
+    entity = test_entities[0]
+    upper_id = entity.external_id.upper()
+    result = await link_resolver.resolve_link(upper_id)
+    assert result is not None
+    assert result.id == entity.id
+
+
+@pytest.mark.asyncio
+async def test_resolve_link_by_external_id_nonexistent(link_resolver):
+    """Test that a valid UUID format that doesn't match any entity returns None."""
+    fake_id = str(uuid.uuid4())
+    result = await link_resolver.resolve_link(fake_id)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_link_non_uuid_falls_through(link_resolver, test_entities, project_prefix):
+    """Test that non-UUID strings skip UUID resolution and use normal lookup."""
+    result = await link_resolver.resolve_link("Core Service")
+    assert result is not None
+    assert result.permalink == f"{project_prefix}/components/core-service"
+
+
+# ============================================================================
+# Fuzzy search best-match selection tests (#640)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_search_selects_first_result(link_resolver, project_prefix):
+    """Test that fuzzy search uses results[0] (best-ranked by the DB) regardless of score sign.
+
+    Both SQLite (BM25, negative scores, ASC) and Postgres (ts_rank, positive scores, DESC)
+    return the best match first. Using results[0] is backend-agnostic and correct.
+    """
+    result = await link_resolver.resolve_link("Auth Serv")
+    assert result is not None
+    # The best match for "Auth Serv" should be Auth Service
+    assert result.permalink == f"{project_prefix}/components/auth-service"

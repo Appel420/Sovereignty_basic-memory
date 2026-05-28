@@ -114,7 +114,13 @@ async def write_file_atomic(path: FilePath, content: str) -> None:
     temp_path = path_obj.with_suffix(".tmp")
 
     try:
-        # Use aiofiles for non-blocking write
+        # Trigger: callers hand us normalized Python text, but the final bytes are allowed
+        #          to use the host platform's native newline convention during the write.
+        # Why: preserving CRLF on Windows keeps local files aligned with editors like
+        #      Obsidian, while FileService now hashes the persisted file bytes instead of
+        #      the pre-write string.
+        # Outcome: this async write stays editor-friendly across platforms without
+        #          reintroducing checksum drift in sync or move detection.
         async with aiofiles.open(temp_path, mode="w", encoding="utf-8") as f:
             await f.write(content)
 
@@ -168,6 +174,13 @@ async def format_markdown_builtin(path: Path) -> Optional[str]:
 
         # Only write if content changed
         if formatted_content != content:
+            # Trigger: mdformat may rewrite markdown content, then the host platform
+            #          decides the newline bytes for the follow-up async text write.
+            # Why: we want formatter output to preserve native newlines instead of
+            #      forcing LF, and the authoritative checksum comes from rereading the
+            #      stored file bytes later in FileService.
+            # Outcome: formatting remains compatible with local editors on Windows while
+            #          checksum-based sync logic stays anchored to on-disk bytes.
             async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
                 await f.write(formatted_content)
 
@@ -446,6 +459,11 @@ def sanitize_for_filename(text: str, replacement: str = "-") -> str:
 
     # compress multiple, repeated replacements
     text = re.sub(f"{re.escape(replacement)}+", replacement, text)
+
+    # Strip trailing periods — they cause "hi-everyone..md" double-dot filenames
+    # when ".md" is appended, which triggers path traversal false positives.
+    # Trailing periods are also invalid on Windows filesystems.
+    text = text.strip(".")
 
     return text.strip(replacement)
 

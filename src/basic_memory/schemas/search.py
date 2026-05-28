@@ -40,7 +40,7 @@ class SearchQuery(BaseModel):
     - title: Title only search
 
     Optionally filter results by:
-    - types: Limit to specific entity types (frontmatter "type")
+    - note_types: Limit to specific note types (frontmatter "type")
     - entity_types: Limit to search item types (entity/observation/relation)
     - after_date: Only items after date
     - metadata_filters: Structured frontmatter filters (field -> value)
@@ -61,13 +61,14 @@ class SearchQuery(BaseModel):
     title: Optional[str] = None  # title only search
 
     # Optional filters
-    types: Optional[List[str]] = None  # Filter by type
+    note_types: Optional[List[str]] = None  # Filter by note type (frontmatter "type")
     entity_types: Optional[List[SearchItemType]] = None  # Filter by entity type
     after_date: Optional[Union[datetime, str]] = None  # Time-based filter
     metadata_filters: Optional[dict[str, Any]] = None  # Structured frontmatter filters
     tags: Optional[List[str]] = None  # Convenience tag filter
     status: Optional[str] = None  # Convenience status filter
     retrieval_mode: SearchRetrievalMode = SearchRetrievalMode.FTS
+    min_similarity: Optional[float] = None  # Per-query override for semantic_min_similarity
 
     @field_validator("after_date")
     @classmethod
@@ -82,7 +83,7 @@ class SearchQuery(BaseModel):
         metadata_is_empty = not self.metadata_filters
         tags_is_empty = not self.tags
         status_is_empty = self.status is None or (isinstance(self.status, str) and not self.status)
-        types_is_empty = not self.types
+        note_types_is_empty = not self.note_types
         entity_types_is_empty = not self.entity_types
         return (
             self.permalink is None
@@ -90,7 +91,7 @@ class SearchQuery(BaseModel):
             and self.title is None
             and text_is_empty
             and self.after_date is None
-            and types_is_empty
+            and note_types_is_empty
             and entity_types_is_empty
             and metadata_is_empty
             and tags_is_empty
@@ -118,6 +119,7 @@ class SearchResult(BaseModel):
     entity: Optional[Permalink] = None
     permalink: Optional[str]
     content: Optional[str] = None
+    matched_chunk: Optional[str] = None
     file_path: str
 
     metadata: Optional[dict] = None
@@ -140,3 +142,5 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
     current_page: int
     page_size: int
+    total: int = 0
+    has_more: bool = False
